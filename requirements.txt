@@ -1,0 +1,29 @@
+# ── Screen Capture ────────────────────────────────────────────────
+dxcam                    # DXGI Desktop Duplication API — bassa latenza, 60+ fps
+
+# ── Computer Vision ───────────────────────────────────────────────
+numpy
+pillow
+opencv-python
+
+# ── OCR ───────────────────────────────────────────────────────────
+# Scegliere UNA delle due righe qui sotto in base all'hardware:
+paddlepaddle             # CPU-only
+# paddlepaddle-gpu       # GPU CUDA (commenta la riga sopra)
+paddleocr
+easyocr                  # Fallback per testi su texture / font irregolari
+
+# ── Traduzione locale ─────────────────────────────────────────────
+transformers             # Helsinki-NLP MarianMT
+sentencepiece            # Tokenizer MarianMT
+# torch già richiesto da paddlepaddle, ma elencato esplicitamente:
+torch                    # CPU — usare torch cu* per CUDA (vedi pytorch.org)
+
+# ── UI / Overlay ──────────────────────────────────────────────────
+PyQt6                    # Finestra trasparente, always-on-top, segnali/slot
+pywin32                  # WS_EX_TRANSPARENT click-through su Windows
+
+# ── UX ────────────────────────────────────────────────────────────
+keyboard                 # Hotkey globali (F9/F10) senza focus sull'app
+pystray                  # Icona system tray
+pillow                   # Richiesto da pystray per l'icona
