@@ -2,32 +2,28 @@
 core/ocr.py — Phase 2: OCR e Text Detection
 
 Responsabilità:
-  - Riceve frame da CaptureThread via queue
-  - Individua automaticamente tutte le regioni di testo (nessuna zona predefinita)
-  - Filtra per confidenza e lunghezza minima
-  - Text delta: invia al TranslationWorker solo le stringhe cambiate rispetto
-    al frame precedente
-  - Fallback EasyOCR per testi su texture / font irregolari
+  - Analizza l'intero frame (nessuna zona predefinita) con PaddleOCR
+  - Fallback a EasyOCR sulle regioni a bassa confidenza (testo su texture,
+    font irregolari, manoscritto)
+  - Filtra i risultati per confidenza minima e lunghezza minima del testo
+  - Text delta: non riemette nulla se il set di testi rilevati è identico
+    al frame precedente (riduce il carico sul TranslationWorker)
+  - Throttling: non esegue OCR più spesso di config.ocr_throttle_ms
 
-Classe pubblica principale:
-  OCRWorker  — ThreadPoolExecutor consumer che produce TextRegion[]
+Classi pubbliche:
+  TextRegion  — dataclass immutabile che rappresenta una regione di testo
+  OCRWorker   — thread consumer: frame_queue → OCR → output_queue
 
-Output atteso (Phase 2):
-  Lista di TextRegion per ogni frame con testo cambiato.
-
-ATTENZIONE: NON sostituire PaddleOCR con Tesseract.
-  Tesseract non restituisce bounding box multi-orientate e ha prestazioni
-  inferiori su font non-latini e pixel art. Vedere KNOWLEDGE_BASE.md §13.
+NON sostituire PaddleOCR con Tesseract (vedere KNOWLEDGE_BASE.md §13).
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
-import time
 import threading
-from dataclasses import dataclass, field
-from queue import Queue
+import time
+from dataclasses import dataclass
+from queue import Empty, Full, Queue
 from typing import Optional
 
 import numpy as np
@@ -36,249 +32,527 @@ from config import config
 
 logger = logging.getLogger(__name__)
 
+# Sotto questa soglia di confidenza PaddleOCR, non vale nemmeno la pena
+# tentare il fallback EasyOCR: il rilevamento è quasi certamente spazzatura
+# (pattern HUD, icone, rumore) e si sprecherebbe solo tempo CPU.
+_EASYOCR_FALLBACK_MIN_CONF = 0.30
+
+# Quante misurazioni di tempo OCR mantenere per calcolare la media mobile
+# esposta in .stats (avg_ocr_ms).
+_STATS_WINDOW = 50
+
 
 # ══════════════════════════════════════════════════════════════════
-# Data types
+# TextRegion
 # ══════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class TextRegion:
     """
-    Una regione di testo rilevata dall'OCR in un frame.
+    Una singola regione di testo rilevata sullo schermo.
 
     Attributes:
-        bbox:       4 punti [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in pixel assoluti
-                    (sistema di coordinate del frame originale pre-downscale).
-        text:       Testo rilevato (lingua sorgente, non ancora tradotto).
-        confidence: Score di confidenza OCR in [0, 1].
-        source:     "paddle" | "easy"  — motore che ha rilevato la regione.
+        bbox: 4 punti (x, y) in coordinate pixel assolute del frame
+              originale, in ordine orario a partire dall'angolo in alto
+              a sinistra: ((x1,y1),(x2,y2),(x3,y3),(x4,y4))
+        text: testo riconosciuto (già .strip()-ato)
+        confidence: punteggio di confidenza 0.0-1.0
+        source: "paddle" oppure "easy" (motore che ha prodotto il risultato)
     """
-    bbox: tuple[tuple[float, float], ...]  # 4 punti
+
+    bbox: tuple
     text: str
     confidence: float
-    source: str = "paddle"
-
-    @property
-    def top_left(self) -> tuple[float, float]:
-        return self.bbox[0]
+    source: str
 
     @property
     def width(self) -> float:
-        return self.bbox[1][0] - self.bbox[0][0]
+        xs = [p[0] for p in self.bbox]
+        return max(xs) - min(xs)
 
     @property
     def height(self) -> float:
-        return self.bbox[2][1] - self.bbox[1][1]
+        ys = [p[1] for p in self.bbox]
+        return max(ys) - min(ys)
+
+    @property
+    def center(self) -> tuple[float, float]:
+        xs = [p[0] for p in self.bbox]
+        ys = [p[1] for p in self.bbox]
+        return (sum(xs) / 4, sum(ys) / 4)
 
 
 # ══════════════════════════════════════════════════════════════════
-# Helpers
-# ══════════════════════════════════════════════════════════════════
-
-def _bbox_from_paddle(raw_bbox: list) -> tuple[tuple[float, float], ...]:
-    """Converte il formato bbox di PaddleOCR in tuple di punti."""
-    return tuple((float(p[0]), float(p[1])) for p in raw_bbox)
-
-
-def _scale_bbox(
-    bbox: tuple[tuple[float, float], ...],
-    scale_x: float,
-    scale_y: float,
-) -> tuple[tuple[float, float], ...]:
-    """Riscala le coordinate bbox dal frame downscalato al frame originale."""
-    return tuple((p[0] * scale_x, p[1] * scale_y) for p in bbox)
-
-
-def _downscale_frame(
-    frame: np.ndarray, target_height: int = 720
-) -> tuple[np.ndarray, float, float]:
-    """
-    Riduce il frame se l'altezza supera target_height.
-
-    Returns:
-        (frame_ridotto, scale_x, scale_y)
-        scale_x/y: fattori per riportare le coordinate bbox all'originale.
-    """
-    import cv2
-
-    h, w = frame.shape[:2]
-    if h <= target_height:
-        return frame, 1.0, 1.0
-
-    scale = target_height / h
-    new_w = int(w * scale)
-    resized = cv2.resize(frame, (new_w, target_height), interpolation=cv2.INTER_AREA)
-    return resized, 1.0 / scale, 1.0 / scale
-
-
-# ══════════════════════════════════════════════════════════════════
-# OCR Worker — Phase 2 (TODO)
+# OCR Worker
 # ══════════════════════════════════════════════════════════════════
 
 class OCRWorker:
     """
-    Worker multi-thread per OCR.
+    Thread consumer che legge (frame, changed_cells) da `input_queue`
+    (prodotta da CaptureThread) ed emette list[TextRegion] su
+    `output_queue` per il TranslationWorker.
 
-    Consuma (frame, changed_cells) dalla `input_queue` e produce
-    list[TextRegion] nella `output_queue`.
-
-    Pipeline interna per ogni frame:
-      1. Downscale opzionale a ocr_downscale_height (config)
-      2. PaddleOCR su tutto il frame
-      3. Filtro: scarta regioni con confidence < threshold o text < min_length
-      4. Fallback EasyOCR su singole regioni con confidence bassa
-      5. Text delta: confronto con frame precedente, scarta invariate
-      6. Riscala bbox alle coordinate originali (se downscalato)
-      7. Emette result in output_queue
-
-    TODO Phase 2: implementare i metodi marcati con # TODO
+    Uso tipico:
+        capture_q = Queue(maxsize=4)
+        ocr_q = Queue(maxsize=4)
+        ocr = OCRWorker(capture_q, ocr_q)
+        ocr.start()      # blocca finché i modelli non sono caricati
+        regions = ocr_q.get()
+        ocr.stop()
     """
 
-    def __init__(
-        self,
-        input_queue: Queue,   # riceve (frame_bgr, changed_cells) da CaptureThread
-        output_queue: Queue,  # produce list[TextRegion] verso TranslationWorker
-        max_workers: int = 2,
-    ) -> None:
+    def __init__(self, input_queue: Queue, output_queue: Queue) -> None:
         self.input_queue = input_queue
         self.output_queue = output_queue
-        self.max_workers = max_workers
 
         self._stop_event = threading.Event()
-        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
-        # PaddleOCR e EasyOCR vengono caricati una sola volta all'avvio
-        self._paddle_ocr = None   # TODO Phase 2: inizializzare in _load_models()
-        self._easy_ocr = None     # TODO Phase 2: inizializzare in _load_models()
+        # Modelli (caricati in _load_models)
+        self._paddle_engine = None
+        self._paddle_major: int = 2
+        self._easy_reader = None  # None = fallback disattivato
 
-        # Text delta: testo dell'ultimo frame per confronto
-        self._prev_texts: set[str] = set()
+        # Per la preview OpenCV in main.py
+        self._latest_frame: Optional[np.ndarray] = None
 
-        # Throttle: non eseguire OCR più spesso di ocr_throttle_ms
-        self._last_ocr_ts: float = 0.0
+        # Text delta: set di testi rilevati nell'ultimo frame emesso
+        self._prev_text_set: frozenset = frozenset()
+
+        # Stats
+        self._n_processed: int = 0
+        self._n_skipped_delta: int = 0
+        self._n_regions: int = 0
+        self._ocr_times: list[float] = []
+        self._t_start: float = 0.0
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Carica i modelli OCR e avvia il thread pool consumer."""
-        logger.info("OCRWorker: caricamento modelli...")
+        """Carica i modelli (bloccante) e avvia il thread consumer."""
         self._load_models()
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.max_workers, thread_name_prefix="OCRWorker"
-        )
-        # Avvia il loop di consumo frame
+        self._t_start = time.perf_counter()
         threading.Thread(
-            target=self._consume_loop, daemon=True, name="OCRConsumer"
+            target=self._consume_loop, daemon=True, name="OCRWorker"
         ).start()
-        logger.info("OCRWorker avviato (workers=%d)", self.max_workers)
+        logger.info("OCRWorker avviato")
 
     def stop(self) -> None:
         self._stop_event.set()
-        if self._executor:
-            self._executor.shutdown(wait=False)
-        logger.info("OCRWorker fermato")
+        logger.info(
+            "OCRWorker fermato — processati=%d  regioni=%d  skip_delta=%d",
+            self._n_processed, self._n_regions, self._n_skipped_delta,
+        )
 
     # ── Model loading ─────────────────────────────────────────────
 
+    @staticmethod
+    def _detect_cuda() -> bool:
+        try:
+            import torch
+            return bool(torch.cuda.is_available())
+        except ImportError:
+            return False
+
     def _load_models(self) -> None:
-        """
-        TODO Phase 2 — Inizializza PaddleOCR ed EasyOCR.
+        cuda_available = self._detect_cuda()
+        logger.info(
+            "OCRWorker: CUDA %s",
+            "disponibile (GPU)" if cuda_available else "non disponibile (CPU)",
+        )
 
-        Esempio implementazione:
-            from paddleocr import PaddleOCR
-            self._paddle_ocr = PaddleOCR(
-                use_angle_cls=config.ocr_use_angle_cls,
-                lang=config.ocr_language,
-                show_log=False,
-                use_gpu=False,  # TODO: rilevare CUDA disponibile
-            )
+        self._paddle_engine, self._paddle_major = self._init_paddle(cuda_available)
+        if self._paddle_major >= 3 and config.ocr_language == "en":
+            model_desc = "PP-OCRv5_mobile_det + en_PP-OCRv5_mobile_rec (pin esplicito)"
+        elif self._paddle_major >= 3:
+            model_desc = "default libreria (nessun pin per lingue diverse da 'en')"
+        else:
+            model_desc = "default v2.x"
+        logger.info(
+            "OCRWorker: PaddleOCR caricato (API v%d, lang=%s, modello=%s, mkldnn=%s)",
+            self._paddle_major, config.ocr_language, model_desc,
+            "disattivato (workaround bug PaddlePaddle 3.3.x)"
+            if (not cuda_available and self._paddle_mkldnn_broken())
+            else "attivo",
+        )
 
+        try:
             import easyocr
-            self._easy_ocr = easyocr.Reader(
-                [config.ocr_language],
-                gpu=False,  # TODO: rilevare CUDA disponibile
-                verbose=False,
+            self._easy_reader = easyocr.Reader(
+                [config.ocr_language], gpu=cuda_available, verbose=False
             )
+            logger.info("OCRWorker: EasyOCR caricato (fallback attivo)")
+        except Exception:
+            logger.warning(
+                "OCRWorker: EasyOCR non disponibile — fallback disattivato",
+                exc_info=True,
+            )
+            self._easy_reader = None
+
+    @staticmethod
+    def _paddle_mkldnn_broken() -> bool:
         """
-        raise NotImplementedError("Phase 2: implementare _load_models()")
+        True solo se la versione di PaddlePaddle installata è quella nota
+        per la regressione oneDNN/PIR su CPU (PaddlePaddle/Paddle#77340),
+        introdotta nella 3.3.0. Se non riusciamo a determinare la versione,
+        assumiamo prudenzialmente che NON sia rotta (di default oneDNN
+        resta attivo, che è il comportamento corretto per tutte le altre
+        versioni).
+        """
+        try:
+            import paddle
+            parts = paddle.__version__.split(".")[:3]
+            major, minor, patch = (int(p) for p in parts)
+        except Exception:
+            return False
+        return (major, minor, patch) >= (3, 3, 0)
+
+    def _init_paddle(self, use_gpu: bool) -> tuple[object, int]:
+        """
+        Inizializza PaddleOCR gestendo le differenze d'interfaccia tra
+        le major version 2.x e 3.x (parametri rinominati in 3.x).
+        """
+        import paddleocr
+
+        version = getattr(paddleocr, "__version__", "2.0.0")
+        try:
+            major = int(version.split(".")[0])
+        except (ValueError, IndexError):
+            major = 2
+
+        if major >= 3:
+            kwargs = dict(
+                use_textline_orientation=config.ocr_use_angle_cls,
+                # Moduli pensati per foto/scansioni di documenti (pagine
+                # storte, distorsione geometrica). Per screenshot di un
+                # gioco sono inutili e pesanti (UVDoc in particolare):
+                # vanno disabilitati esplicitamente, altrimenti alcune
+                # versioni di PaddleOCR 3.x li attivano di default.
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                device="gpu" if use_gpu else "cpu",
+            )
+            # IMPORTANTE — leggere prima di modificare questo blocco:
+            # PaddleOCR emette
+            #   UserWarning: `lang` and `ocr_version` will be ignored
+            #   when model names or model directories are not `None`.
+            # Cioè: appena si specifica UN SOLO nome di modello esplicito
+            # (es. solo text_detection_model_name), la selezione
+            # automatica basata su `lang`/`ocr_version` viene disattivata
+            # per L'INTERA pipeline, non solo per il modulo specificato.
+            # Il risultato osservato: la detection passa al mobile
+            # leggero come richiesto, ma la recognition ripiomba sul
+            # default pesante (PP-OCRv6_medium_rec, ~ordini di grandezza
+            # più lento del mobile) invece di restare quella scelta da
+            # `lang="en"`. Per questo i due nomi vanno sempre fissati
+            # insieme, mai uno solo.
+            #
+            # Al momento la mappatura nome-modello per lingua è
+            # verificata solo per l'inglese (il caso d'uso primario).
+            # Per altre lingue sorgente si lascia che `lang`/`ocr_version`
+            # scelgano i modelli di default (verosimilmente più pesanti):
+            # da rivedere quando si configurerà una lingua sorgente
+            # diversa da "en" (vedi anche nota in memoria sui codici
+            # lingua EasyOCR/PaddleOCR non sempre coincidenti).
+            if config.ocr_language == "en":
+                kwargs["text_detection_model_name"] = "PP-OCRv5_mobile_det"
+                kwargs["text_recognition_model_name"] = "en_PP-OCRv5_mobile_rec"
+            else:
+                kwargs["lang"] = config.ocr_language
+                kwargs["ocr_version"] = "PP-OCRv5"
+            if not use_gpu and self._paddle_mkldnn_broken():
+                # PaddlePaddle 3.3.x ha una regressione nel backend oneDNN/PIR
+                # su CPU: predict() solleva
+                #   NotImplementedError: ConvertPirAttribute2RuntimeAttribute
+                #   not support [pir::ArrayAttribute<pir::DoubleAttribute>]
+                # su alcune CPU (PaddlePaddle/Paddle#77340).
+                #
+                # ATTENZIONE: disabilitare oneDNN con enable_mkldnn=False su
+                # PaddlePaddle 3.3.x innesca una SECONDA regressione, più
+                # grave: allocazione di decine di GB di RAM / hang
+                # apparentemente infinito durante predict() (vedi
+                # PaddlePaddle/PaddleOCR#17955). Va quindi applicato solo
+                # come ultima risorsa quando la versione installata è
+                # esattamente quella difettosa; la soluzione corretta è
+                # evitare del tutto quella versione (vedere log all'avvio).
+                kwargs["enable_mkldnn"] = False
+        else:
+            kwargs = dict(
+                lang=config.ocr_language,
+                use_angle_cls=config.ocr_use_angle_cls,
+                use_gpu=use_gpu,
+                show_log=False,
+            )
+
+        try:
+            engine = paddleocr.PaddleOCR(**kwargs)
+        except TypeError:
+            # Versione intermedia con firma diversa: ritenta con il set
+            # minimo di parametri comuni a (quasi) tutte le versioni,
+            # preservando comunque il workaround enable_mkldnn se presente.
+            logger.warning(
+                "OCRWorker: parametri PaddleOCR non riconosciuti per v%s, "
+                "ritento con configurazione minima", version,
+            )
+            minimal: dict = {}
+            for key in (
+                "lang", "enable_mkldnn", "use_doc_orientation_classify",
+                "use_doc_unwarping", "ocr_version",
+                "text_detection_model_name", "text_recognition_model_name",
+            ):
+                if key in kwargs:
+                    minimal[key] = kwargs[key]
+            try:
+                engine = paddleocr.PaddleOCR(**minimal)
+            except TypeError:
+                engine = paddleocr.PaddleOCR(lang=config.ocr_language)
+
+        return engine, major
 
     # ── Consumer loop ─────────────────────────────────────────────
 
     def _consume_loop(self) -> None:
-        """Loop principale: prende frame dalla queue e schedula OCR."""
+        last_run = 0.0
+
         while not self._stop_event.is_set():
             try:
-                frame, cells = self.input_queue.get(timeout=0.1)
-            except Exception:
+                item = self.input_queue.get(timeout=0.5)
+            except Empty:
                 continue
 
-            # Throttle: rispetta ocr_throttle_ms
+            # Scarta eventuali frame accumulati: ci interessa solo il più
+            # recente (stessa filosofia "priorità alla latenza" di capture.py)
+            while True:
+                try:
+                    item = self.input_queue.get_nowait()
+                except Empty:
+                    break
+
+            frame, _changed_cells = item
+            self._latest_frame = frame
+
+            # Throttling: non eseguire OCR più spesso di ocr_throttle_ms
             now = time.perf_counter()
-            elapsed_ms = (now - self._last_ocr_ts) * 1000
+            elapsed_ms = (now - last_run) * 1000
             if elapsed_ms < config.ocr_throttle_ms:
                 time.sleep((config.ocr_throttle_ms - elapsed_ms) / 1000)
+            last_run = time.perf_counter()
 
-            self._last_ocr_ts = time.perf_counter()
-            if self._executor:
-                self._executor.submit(self._process_frame, frame, cells)
+            t0 = time.perf_counter()
+            logger.debug("OCRWorker: elaborazione frame in corso...")
+            try:
+                regions = self._process_frame(frame)
+            except Exception:
+                logger.exception("OCRWorker: errore durante _process_frame")
+                continue
+            dt_ms = (time.perf_counter() - t0) * 1000
+            if dt_ms > 2000:
+                logger.warning(
+                    "OCRWorker: frame elaborato in %.0f ms (insolitamente lento)",
+                    dt_ms,
+                )
 
-    # ── OCR processing ────────────────────────────────────────────
+            self._ocr_times.append(dt_ms)
+            if len(self._ocr_times) > _STATS_WINDOW:
+                self._ocr_times.pop(0)
 
-    def _process_frame(
-        self, frame: np.ndarray, changed_cells: list[bool]
-    ) -> None:
+            if regions is None:
+                # Text delta: nessun cambiamento rispetto al frame precedente
+                continue
+
+            self._n_processed += 1
+            self._n_regions += len(regions)
+
+            try:
+                self.output_queue.put_nowait(regions)
+            except Full:
+                try:
+                    self.output_queue.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    self.output_queue.put_nowait(regions)
+                except Full:
+                    pass
+
+    # ── Frame processing ─────────────────────────────────────────
+
+    def _process_frame(self, frame: np.ndarray) -> Optional[list[TextRegion]]:
         """
-        TODO Phase 2 — Esegue OCR su un frame e aggiorna output_queue.
-
-        Logica:
-          1. Downscale se config.ocr_downscale
-          2. Chiama _run_paddle(frame) → list[TextRegion]
-          3. Per ogni regione con confidence < threshold: chiama _run_easy(crop)
-          4. Filtra per lunghezza minima e confidence
-          5. Text delta: confronta con self._prev_texts
-          6. Se ci sono testi nuovi/cambiati: riscala bbox, emetti in output_queue
-        """
-        raise NotImplementedError("Phase 2: implementare _process_frame()")
-
-    def _run_paddle(self, frame: np.ndarray) -> list[TextRegion]:
-        """
-        TODO Phase 2 — Esegue PaddleOCR sull'intero frame.
+        Pipeline completa su un singolo frame:
+          downscale (opzionale) → PaddleOCR → fallback EasyOCR sulle
+          regioni a bassa confidenza → filtro → rescale bbox → text delta
 
         Returns:
-            Lista di TextRegion (con bbox in coordinate del frame passato).
-
-        Esempio:
-            result = self._paddle_ocr.ocr(frame, cls=config.ocr_use_angle_cls)
-            regions = []
-            for line in (result[0] or []):
-                bbox_raw, (text, conf) = line
-                if conf >= config.ocr_confidence_threshold:
-                    regions.append(TextRegion(
-                        bbox=_bbox_from_paddle(bbox_raw),
-                        text=text,
-                        confidence=conf,
-                        source="paddle",
-                    ))
-            return regions
+            list[TextRegion] se il set di testi è cambiato rispetto al
+            frame precedente, altrimenti None (= skip, nulla da emettere).
         """
-        raise NotImplementedError("Phase 2: implementare _run_paddle()")
+        ocr_frame, scale = self._maybe_downscale(frame)
+        raw = self._run_paddle(ocr_frame)
 
-    def _run_easy(
-        self, crop: np.ndarray, original_bbox: tuple
-    ) -> Optional[TextRegion]:
+        regions: list[TextRegion] = []
+        for bbox_ds, text, conf in raw:
+            bbox = self._rescale_bbox(bbox_ds, scale)
+            text = text.strip()
+            source = "paddle"
+
+            if conf < config.ocr_confidence_threshold:
+                if self._easy_reader is None or conf < _EASYOCR_FALLBACK_MIN_CONF:
+                    continue
+                fallback = self._run_easyocr_fallback(frame, bbox)
+                if fallback is None:
+                    continue
+                text, conf = fallback
+                text = text.strip()
+                source = "easy"
+
+            if conf < config.ocr_confidence_threshold:
+                continue
+            if len(text) < config.ocr_min_text_length:
+                continue
+
+            regions.append(
+                TextRegion(bbox=bbox, text=text, confidence=conf, source=source)
+            )
+
+        current_text_set = frozenset(r.text for r in regions)
+        if current_text_set == self._prev_text_set:
+            self._n_skipped_delta += 1
+            return None
+
+        self._prev_text_set = current_text_set
+        return regions
+
+    @staticmethod
+    def _maybe_downscale(frame: np.ndarray) -> tuple[np.ndarray, float]:
+        """Ridimensiona il frame a ocr_downscale_height se più alto. Restituisce (frame, scale)."""
+        if not config.ocr_downscale:
+            return frame, 1.0
+
+        h, w = frame.shape[:2]
+        if h <= config.ocr_downscale_height:
+            return frame, 1.0
+
+        import cv2
+        scale = config.ocr_downscale_height / h
+        new_w = max(1, int(w * scale))
+        resized = cv2.resize(
+            frame, (new_w, config.ocr_downscale_height), interpolation=cv2.INTER_AREA
+        )
+        return resized, scale
+
+    @staticmethod
+    def _rescale_bbox(bbox: tuple, scale: float) -> tuple:
+        """Riporta una bbox dalle coordinate (eventualmente downscalate) a quelle originali."""
+        if scale == 1.0:
+            return tuple((float(p[0]), float(p[1])) for p in bbox)
+        return tuple((float(p[0]) / scale, float(p[1]) / scale) for p in bbox)
+
+    # ── PaddleOCR ─────────────────────────────────────────────────
+
+    def _run_paddle(self, frame: np.ndarray) -> list[tuple]:
         """
-        TODO Phase 2 — Fallback EasyOCR su un crop di regione a bassa confidence.
-
-        Args:
-            crop:          Ritaglio numpy BGR della regione
-            original_bbox: bbox originale da PaddleOCR (per mantenere coordinate)
-
-        Returns:
-            TextRegion con source="easy" o None se nulla rilevato.
+        Esegue PaddleOCR su `frame` e normalizza l'output a:
+            list[(bbox_4pts, text, confidence)]
+        gestendo sia l'API 2.x (.ocr) sia la 3.x (.predict).
         """
-        raise NotImplementedError("Phase 2: implementare _run_easy()")
+        if self._paddle_major >= 3:
+            return self._run_paddle_v3(frame)
+        return self._run_paddle_v2(frame)
+
+    def _run_paddle_v2(self, frame: np.ndarray) -> list[tuple]:
+        out: list[tuple] = []
+        try:
+            raw = self._paddle_engine.ocr(frame, cls=config.ocr_use_angle_cls)
+        except TypeError:
+            raw = self._paddle_engine.ocr(frame)
+
+        if not raw:
+            return out
+
+        # In 2.x raw è list[list[ [box, (text, score)] ]] — una lista per pagina.
+        page = raw[0] if isinstance(raw[0], list) or raw[0] is None else raw
+        for line in (page or []):
+            try:
+                box, (text, score) = line
+                bbox = tuple((float(p[0]), float(p[1])) for p in box)
+                out.append((bbox, text, float(score)))
+            except (ValueError, TypeError):
+                logger.debug("OCRWorker: riga PaddleOCR v2 non riconosciuta: %r", line)
+        return out
+
+    def _run_paddle_v3(self, frame: np.ndarray) -> list[tuple]:
+        out: list[tuple] = []
+        try:
+            results = self._paddle_engine.predict(frame)
+        except AttributeError:
+            results = self._paddle_engine.ocr(frame)
+
+        for res in results or []:
+            try:
+                texts = res.get("rec_texts", [])
+                scores = res.get("rec_scores", [])
+                polys = res.get("rec_polys", res.get("rec_boxes", []))
+            except AttributeError:
+                logger.debug("OCRWorker: risultato PaddleOCR v3 non riconosciuto: %r", res)
+                continue
+
+            for text, score, poly in zip(texts, scores, polys):
+                bbox = tuple((float(p[0]), float(p[1])) for p in poly)
+                out.append((bbox, text, float(score)))
+        return out
+
+    # ── EasyOCR fallback ──────────────────────────────────────────
+
+    def _run_easyocr_fallback(
+        self, frame: np.ndarray, bbox: tuple
+    ) -> Optional[tuple[str, float]]:
+        """
+        Ritenta il riconoscimento su un crop della bbox PaddleOCR (in
+        coordinate originali, non downscalate) usando EasyOCR. La
+        posizione della bbox originale viene mantenuta — non si usa
+        quella restituita da EasyOCR.
+        """
+        import cv2
+
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        h, w = frame.shape[:2]
+
+        pad = 4
+        x1 = max(0, int(min(xs)) - pad)
+        y1 = max(0, int(min(ys)) - pad)
+        x2 = min(w, int(max(xs)) + pad)
+        y2 = min(h, int(max(ys)) + pad)
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop = frame[y1:y2, x1:x2]
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+
+        try:
+            results = self._easy_reader.readtext(crop_rgb)
+        except Exception:
+            logger.debug("OCRWorker: EasyOCR fallback fallito", exc_info=True)
+            return None
+
+        if not results:
+            return None
+
+        # Più righe nel crop → le uniamo; la confidenza è la minima
+        # (approccio prudente: il pezzo più debole determina la confidenza totale).
+        texts = [r[1] for r in results]
+        confs = [r[2] for r in results]
+        return " ".join(texts), min(confs)
+
+    # ── Stats ─────────────────────────────────────────────────────
 
     @property
     def stats(self) -> dict:
-        """TODO Phase 2: restituire statistiche (frame processati, tempo medio OCR, ecc.)"""
-        return {}
+        avg_ms = sum(self._ocr_times) / len(self._ocr_times) if self._ocr_times else 0.0
+        return {
+            "frames_processed": self._n_processed,
+            "avg_ocr_ms": round(avg_ms, 1),
+            "regions_emitted": self._n_regions,
+            "frames_skipped_delta": self._n_skipped_delta,
+            "easy_available": self._easy_reader is not None,
+        }
