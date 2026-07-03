@@ -12,6 +12,11 @@ Modalità di avvio:
     python main.py --phase 2 --no-preview     # Solo testo nel terminale
     python main.py --phase 2 --monitor 1      # Usa monitor secondario
 
+  Phase 3:
+    python main.py --phase 3                  # Test traduzione end-to-end
+    python main.py --phase 3 --no-preview     # Solo testo nel terminale
+    python main.py --phase 3 --monitor 1      # Usa monitor secondario
+
   Futura (Phase 4+):
     python main.py                            # Avvio completo con overlay Qt
 
@@ -34,13 +39,71 @@ from queue import Queue
 
 from config import config
 
+# ── Encoding output ───────────────────────────────────────────────
+# Su Windows, quando stdout/stderr sono collegati alla console PowerShell
+# usano UTF-8, ma quando l'output viene reindirizzato su file (> file.log)
+# Python passa silenziosamente alla codepage ANSI di sistema (es. cp1252),
+# che non sa rappresentare i caratteri Unicode usati nei banner/log
+# (═, ◀, ∅, ecc.) e solleva UnicodeEncodeError. Forziamo esplicitamente
+# UTF-8 su entrambi gli stream così il comportamento è identico sia a
+# schermo sia con redirect su file (necessario per i log da allegare
+# durante il testing — vedere convenzioni di test nel progetto).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        # reconfigure() non disponibile (Python < 3.7) o stream non
+        # riconfigurabile (es. già chiuso/sostituito): si prosegue con
+        # l'encoding di default, non è un errore fatale.
+        pass
+
 # ── Logging ───────────────────────────────────────────────────────
+# stream=sys.stdout (invece del default sys.stderr di StreamHandler):
+# su Windows PowerShell, quando si fa redirect con `2>&1 > file.log`,
+# OGNI riga scritta da un processo nativo su stderr viene avvolta in un
+# fuorviante banner "NativeCommandError" con tanto di falso traceback,
+# anche se non è un errore reale. I nostri log (INFO/DEBUG/WARNING) non
+# sono errori: instradarli su stdout evita quel rumore. I veri errori
+# Python (eccezioni non gestite, traceback) continuano comunque a finire
+# su stderr come previsto, quindi restano visibili e correttamente
+# segnalati da PowerShell.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
     datefmt="%H:%M:%S",
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
+
+# Logger dei nostri moduli su cui vogliamo garantire il livello DEBUG
+# quando richiesto da CLI. Impostare il livello direttamente su questi
+# logger (invece di affidarsi solo al root) è importante perché alcune
+# dipendenze (in particolare PaddleOCR/PaddleX) riconfigurano il logging
+# Python al proprio caricamento e possono silenziosamente riportare il
+# livello del root logger a INFO/WARNING — un livello impostato
+# esplicitamente su un logger figlio non viene invece sovrascritto da
+# modifiche successive agli antenati.
+_PROJECT_LOGGERS = (
+    "core.capture",
+    "core.ocr",
+    "core.translator",
+    "core.pipeline",
+    "__main__",
+)
+
+
+def _enable_debug_logging() -> None:
+    """
+    Imposta il livello DEBUG sul root logger e, esplicitamente, su tutti
+    i logger dei nostri moduli. Va richiamata sia all'avvio (subito dopo
+    il parsing degli argomenti) sia di nuovo subito dopo il caricamento
+    dei modelli (PaddleOCR/EasyOCR/MarianMT) nel caso una di queste
+    librerie abbia silenziosamente resettato il livello del root logger
+    durante l'inizializzazione — vedere nota sopra.
+    """
+    logging.getLogger().setLevel(logging.DEBUG)
+    for _name in _PROJECT_LOGGERS:
+        logging.getLogger(_name).setLevel(logging.DEBUG)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -494,6 +557,242 @@ def _run_phase2_preview(ocr, regions: list) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════
+# Phase 3: Translation Test
+# ══════════════════════════════════════════════════════════════════
+
+def run_phase3(monitor_index: int, preview: bool, debug: bool = False) -> None:
+    """
+    Test end-to-end della pipeline completa capture → OCR → traduzione
+    (Phase 3), usando TranslationPipeline (core/pipeline.py).
+
+    Avvia Capture + OCR + Translation e mostra:
+      - Coppie (bbox, testo tradotto) rilevate
+      - Preview frame con bounding box e testo tradotto sovrapposto (se --preview)
+      - Statistiche aggregate (capture/OCR/traduzione) ogni 5 secondi
+      - Report finale a Ctrl+C
+
+    NOTA: OverlayWindow (Phase 4 UI) non è ancora implementato, quindi la
+    pipeline gira in modalità headless: i risultati vengono letti
+    direttamente da `pipeline.translation_queue` invece che tramite
+    Qt signal.
+    """
+    from core.capture import list_monitors
+    from core.pipeline import TranslationPipeline
+
+    _print_banner("Phase 3: Translation Pipeline")
+
+    # ── Lista monitor ─────────────────────────────────────────────
+    monitors = list_monitors()
+    if not monitors:
+        logger.error("Nessun monitor rilevato.")
+        sys.exit(1)
+
+    print("Monitor disponibili:")
+    for m in monitors:
+        w = m.get("width", "?")
+        h = m.get("height", "?")
+        mark = " ◀ selezionato" if m["index"] == monitor_index else ""
+        print(f"  [{m['index']}] {m.get('name', 'Monitor')}  {w}×{h}{mark}")
+    print()
+
+    if monitor_index >= len(monitors):
+        logger.error("Monitor %d non trovato (disponibili: %d).", monitor_index, len(monitors))
+        sys.exit(1)
+
+    config.monitor_index = monitor_index
+
+    print(
+        f"Traduzione configurata:  {config.source_language} → {config.target_language}  "
+        f"(modello: {config.marian_model_name})"
+    )
+    print()
+    print("Caricamento modelli (traduzione + OCR)...")
+    print("Al primo avvio: PaddleOCR scarica ~100 MB, MarianMT scarica ~300 MB. Attendere.")
+    print()
+
+    # ── Setup pipeline ────────────────────────────────────────────
+    # Nessun overlay ancora disponibile (Phase 4 UI): modalità headless,
+    # si legge direttamente pipeline.translation_queue.
+    pipeline = TranslationPipeline()
+
+    running = True
+
+    def _on_signal(sig, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    # ── Avvio ─────────────────────────────────────────────────────
+    pipeline.start()   # blocca finché i modelli (OCR + traduzione) non sono caricati
+
+    # Riapplica il livello DEBUG: PaddleOCR/PaddleX possono aver
+    # silenziosamente resettato il root logger durante il caricamento
+    # dei modelli avvenuto dentro pipeline.start() (vedere nota su
+    # _enable_debug_logging più sopra nel file).
+    if debug:
+        if logging.getLogger("core.translator").getEffectiveLevel() > logging.DEBUG:
+            logger.warning(
+                "Livello di logging resettato da una dipendenza durante il "
+                "caricamento dei modelli (probabile PaddleOCR/PaddleX) — "
+                "lo riapplico esplicitamente."
+            )
+        _enable_debug_logging()
+
+    print("Pipeline di traduzione avviata.")
+    if preview:
+        print("Preview attiva — premi 'q' nella finestra OpenCV o Ctrl+C per uscire.")
+    else:
+        print("Modalità headless — premi Ctrl+C per uscire.")
+    print()
+
+    latest_output: list = []
+    t_last_stats = time.perf_counter()
+
+    try:
+        while running:
+            # Drain translation queue: conserva solo il più recente
+            new_batch = None
+            while not pipeline.translation_queue.empty():
+                try:
+                    new_batch = pipeline.translation_queue.get_nowait()
+                except Exception:
+                    break
+
+            if new_batch is not None:
+                latest_output = new_batch
+                _print_translations(latest_output)
+
+            # Stats ogni 5 secondi
+            now = time.perf_counter()
+            if now - t_last_stats >= 5.0:
+                s = pipeline.stats
+                cap_s = s.get("capture", {})
+                ocr_s = s.get("ocr", {})
+                tr_s = s.get("translation", {})
+                print(
+                    f"  [stats]  cap_fps={cap_s.get('effective_fps', 0):.1f}  "
+                    f"ocr_frames={ocr_s.get('frames_processed', 0)}  "
+                    f"ocr_regions={ocr_s.get('regions_emitted', 0)}  "
+                    f"tr_batches={tr_s.get('batches_processed', 0)}  "
+                    f"cache_hit={tr_s.get('cache_hit_rate_pct', 0)}%  "
+                    f"avg_tr_ms={tr_s.get('avg_translation_ms', 0)}  "
+                    f"device={tr_s.get('device', '?')}"
+                )
+                t_last_stats = now
+
+            if preview:
+                _run_phase3_preview(pipeline, latest_output)
+                try:
+                    import cv2
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        running = False
+                except ImportError:
+                    pass
+            else:
+                time.sleep(0.05)
+
+    finally:
+        running = False
+        pipeline.stop()
+        try:
+            import cv2
+            cv2.destroyAllWindows()
+        except ImportError:
+            pass
+
+        # ── Report finale ─────────────────────────────────────────
+        s = pipeline.stats
+        cap_s = s.get("capture", {})
+        ocr_s = s.get("ocr", {})
+        tr_s = s.get("translation", {})
+        _print_banner("Report Finale Phase 3")
+        print(f"  Frame capture        : {cap_s.get('frames_captured', 0)}  (skip={cap_s.get('frames_skipped', 0)})")
+        print(f"  Frame OCR processati : {ocr_s.get('frames_processed', 0)}")
+        print(f"  Batch tradotti       : {tr_s.get('batches_processed', 0)}")
+        print(f"  Traduzioni totali    : {tr_s.get('translations_total', 0)}")
+        print(f"  Cache hit rate       : {tr_s.get('cache_hit_rate_pct', 0)}%")
+        print(f"  Tempo medio batch    : {tr_s.get('avg_translation_ms', 0)} ms")
+        print(f"  Device               : {tr_s.get('device', '?')}")
+        print()
+        print("Phase 3 completata. Prossimo step: implementare ui/overlay.py (Phase 4).")
+        print()
+
+
+def _print_translations(output: list) -> None:
+    """Stampa le coppie (bbox, testo tradotto) nel terminale con timestamp."""
+    import datetime
+    ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+    if not output:
+        print(f"[{ts}]  ∅  nessuna traduzione (schermo pulito o testo sparito)")
+        return
+
+    print(f"[{ts}]  {len(output)} traduzione/i")
+    for bbox, text in output:
+        x = int(bbox[0][0])
+        y = int(bbox[0][1])
+        preview = text[:60].replace("\n", " ")
+        print(f"  @({x},{y})  \"{preview}\"")
+    print()
+
+
+def _run_phase3_preview(pipeline, output: list) -> None:
+    """
+    Mostra preview OpenCV con bounding box e testo tradotto sovrapposti
+    al frame catturato (letto dal buffer interno di OCRWorker, come in
+    Phase 2).
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        time.sleep(0.05)
+        return
+
+    ocr_worker = getattr(pipeline, "_ocr", None)
+    frame = getattr(ocr_worker, "_latest_frame", None) if ocr_worker else None
+    if frame is None:
+        time.sleep(0.05)
+        return
+
+    display = frame.copy()
+    orig_h, orig_w = display.shape[:2]
+
+    # Ridimensiona per display (max 1280px wide)
+    if orig_w > 1280:
+        sx = 1280 / orig_w
+        display = cv2.resize(display, (1280, int(orig_h * sx)))
+    else:
+        sx = 1.0
+    sy = sx  # aspect ratio invariato (downscale isotropico)
+
+    for bbox, text in output:
+        pts = np.array(
+            [[int(p[0] * sx), int(p[1] * sy)] for p in bbox],
+            dtype=np.int32,
+        )
+        color = (255, 200, 0)
+        cv2.polylines(display, [pts], isClosed=True, color=color, thickness=2)
+
+        lx = int(bbox[0][0] * sx)
+        ly = int(bbox[0][1] * sy) - 6
+        label = text[:40]
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(display, (lx, max(0, ly - th - 2)), (lx + tw, max(th, ly) + 2), (0, 0, 0), -1)
+        cv2.putText(display, label, (lx, max(th, ly)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+    stat_label = f"Traduzioni: {len(output)}  |  {config.source_language}->{config.target_language}"
+    cv2.rectangle(display, (0, 0), (len(stat_label) * 7 + 10, 22), (0, 0, 0), -1)
+    cv2.putText(display, stat_label, (5, 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+    cv2.imshow("Game Translator — Phase 3 Translation Preview  [q = esci]", display)
+
+
+# ══════════════════════════════════════════════════════════════════
 # Full Application (Phase 4+)
 # ══════════════════════════════════════════════════════════════════
 
@@ -543,7 +842,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         metavar="N",
-        help="Fase da testare (1=capture, 2=ocr, 3=translation). "
+        help="Fase da testare (1=capture, 2=ocr, 3=traduzione). "
              "Omettere per avvio completo (Phase 4+).",
     )
     p.add_argument(
@@ -577,7 +876,7 @@ if __name__ == "__main__":
     args = parse_args()
 
     if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+        _enable_debug_logging()
 
     # Aggiorna config da CLI
     config.monitor_index = args.monitor
@@ -595,13 +894,20 @@ if __name__ == "__main__":
             monitor_index=args.monitor,
             preview=not args.no_preview,
         )
+    elif args.phase == 3:
+        run_phase3(
+            monitor_index=args.monitor,
+            preview=not args.no_preview,
+            debug=args.debug,
+        )
     elif args.phase is None:
         # TODO Phase 4: sostituire con run_full_app() quando disponibile
         print("Modalità completa non ancora disponibile.")
         print("  python main.py --phase 1   # test capture pipeline")
         print("  python main.py --phase 2   # test OCR pipeline")
+        print("  python main.py --phase 3   # test traduzione end-to-end")
         sys.exit(0)
     else:
         print(f"Phase {args.phase} non ancora implementata.")
-        print("Fasi disponibili: 1 (capture), 2 (OCR).")
+        print("Fasi disponibili: 1 (capture), 2 (OCR), 3 (traduzione).")
         sys.exit(1)

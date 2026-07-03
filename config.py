@@ -43,11 +43,30 @@ class Config:
     ocr_downscale: bool = True
     ocr_downscale_height: int = 720
 
+    # Merge bounding box adiacenti: PaddleOCR isola spesso singole parole
+    # in box separate (es. "Press" e "Start" invece di "Press Start"),
+    # rompendo il contesto per MarianMT e producendo traduzioni prive di
+    # senso. Queste soglie sono espresse in multipli dell'altezza media
+    # delle due box confrontate ("em"), non in pixel assoluti, così da
+    # restare coerenti indipendentemente dalla risoluzione/downscale.
+    ocr_merge_adjacent_boxes: bool = True
+    ocr_merge_max_gap_em: float = 0.6              # Gap orizzontale massimo per unire due box sulla stessa riga
+    ocr_merge_max_vertical_offset_em: float = 0.4  # Tolleranza verticale per considerare due box sulla stessa riga
+
     # ── Traduzione ────────────────────────────────────────────────
     source_language: str = "en"     # Lingua sorgente (codice ISO 639-1)
     target_language: str = "it"     # Lingua destinazione
     translation_cache_maxsize: int = 1024   # Dimensione LRU cache frasi tradotte
     models_dir: Path = field(default_factory=lambda: ROOT_DIR / "models")
+    # Parametri di generazione MarianMT. I modelli Helsinki-NLP/opus-mt-*
+    # di default possono usare beam search (num_beams del model config,
+    # spesso 4-6): su CPU questo può moltiplicare i tempi di inferenza
+    # di diverse volte rispetto a una ricerca greedy. Per testo di gioco
+    # (dialoghi/HUD/menu, tipicamente brevi) la perdita di qualità della
+    # ricerca greedy è generalmente trascurabile rispetto al guadagno
+    # di latenza. Vedere KNOWLEDGE_BASE.md §5 (throttling/latenza).
+    translation_num_beams: int = 1          # 1 = greedy (veloce), >1 = beam search
+    translation_max_new_tokens: int = 128   # Limite lunghezza traduzione generata
 
     # ── Overlay ───────────────────────────────────────────────────
     overlay_bg_alpha: int = 160             # Opacità sfondo label (0–255)

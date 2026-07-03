@@ -388,6 +388,7 @@ class OCRWorker:
         """
         ocr_frame, scale = self._maybe_downscale(frame)
         raw = self._run_paddle(ocr_frame)
+        logger.debug("OCRWorker: PaddleOCR ha rilevato %d elemento/i grezzo/i", len(raw))
 
         regions: list[TextRegion] = []
         for bbox_ds, text, conf in raw:
@@ -415,8 +416,14 @@ class OCRWorker:
             )
 
         current_text_set = frozenset(r.text for r in regions)
+        logger.debug(
+            "OCRWorker: %d regione/i dopo il filtro: %s",
+            len(regions),
+            [r.text[:30] for r in regions],
+        )
         if current_text_set == self._prev_text_set:
             self._n_skipped_delta += 1
+            logger.debug("OCRWorker: nessuna variazione rispetto al frame precedente — skip")
             return None
 
         self._prev_text_set = current_text_set
