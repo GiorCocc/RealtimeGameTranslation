@@ -52,6 +52,16 @@ class Config:
     ocr_merge_adjacent_boxes: bool = True
     ocr_merge_max_gap_em: float = 0.6              # Gap orizzontale massimo per unire due box sulla stessa riga
     ocr_merge_max_vertical_offset_em: float = 0.4  # Tolleranza verticale per considerare due box sulla stessa riga
+    # Merge verticale (multi-riga): unisce righe impilate verticalmente con
+    # simile estensione orizzontale. Fondamentale per le visual novel, dove
+    # il dialog box ha 2-3 righe di testo che vanno tradotte come un blocco.
+    ocr_merge_vertical_blocks: bool = True
+    ocr_merge_max_line_gap_em: float = 1.2         # Gap verticale massimo tra righe da unire (in em)
+    # Soglia scene change: se almeno questa frazione delle celle della griglia
+    # MD5 è cambiata, si assume un cambio scena completo e il text-delta
+    # dell'OCR viene resettato per forzare un nuovo emit (evita label
+    # "fantasma" della schermata precedente).
+    ocr_scene_change_threshold: float = 0.75       # Frazione celle cambiate per rilevare un scene change
 
     # ── Traduzione ────────────────────────────────────────────────
     source_language: str = "en"     # Lingua sorgente (codice ISO 639-1)

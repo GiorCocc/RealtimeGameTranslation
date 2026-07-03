@@ -236,8 +236,100 @@ def merge_adjacent_regions(
     return merged
 
 
-# ══════════════════════════════════════════════════════════════════
-# OCR Worker
+def merge_vertical_blocks(
+    regions: list[TextRegion],
+    max_line_gap_em: float,
+    min_horizontal_overlap_ratio: float = 0.25,
+) -> list[TextRegion]:
+    """
+    Unisce regioni impilate verticalmente in un unico blocco di testo.
+
+    Mentre `merge_adjacent_regions` unisce parole sulla stessa riga
+    orizzontale, questa funzione unisce righe di testo consecutive che
+    appartengono allo stesso paragrafo/dialog box (es. visual novel,
+    sottotitoli, descrizioni multi-riga).
+
+    Criterio di merge:
+      1. Le due regioni si sovrappongono orizzontalmente per almeno
+         `min_horizontal_overlap_ratio` rispetto alla regione più stretta.
+      2. Il gap verticale (fondo riga sopra → testa riga sotto) è inferiore
+         a `max_line_gap_em` volte l'altezza media delle due righe.
+
+    Il testo viene concatenato in ordine dall'alto verso il basso,
+    separato da uno spazio (il tokenizer MarianMT gestisce bene i testi
+    multi-frase come un'unica stringa).
+
+    Args:
+        regions: lista di TextRegion già post-merge orizzontale
+        max_line_gap_em: gap verticale massimo (in em) tra righe adiacenti
+        min_horizontal_overlap_ratio: sovrapposizione orizzontale minima
+            perché due righe vengano considerate parte dello stesso blocco
+
+    Returns:
+        Nuova lista di TextRegion con blocchi multi-riga unificati.
+    """
+    if len(regions) <= 1:
+        return regions
+
+    # Ordina dall'alto verso il basso
+    sorted_r = sorted(regions, key=lambda r: _region_bounds(r)[1])
+
+    groups: list[list[TextRegion]] = [[sorted_r[0]]]
+
+    for region in sorted_r[1:]:
+        merged_into_group = False
+        r_left, r_top, r_right, r_bottom = _region_bounds(region)
+        r_width = max(r_right - r_left, 1.0)
+
+        for group in reversed(groups):
+            # Confronta con l'ultimo elemento del gruppo
+            g_last = group[-1]
+            g_left, g_top, g_right, g_bottom = _region_bounds(g_last)
+            g_width = max(g_right - g_left, 1.0)
+
+            # Gap verticale tra fondo del gruppo e cima della regione
+            vert_gap = r_top - g_bottom
+            avg_height = ((g_bottom - g_top) + (r_bottom - r_top)) / 2 or 1.0
+
+            if vert_gap > max_line_gap_em * avg_height or vert_gap < -avg_height:
+                # Troppo lontano o sovrapposto in modo anomalo: no merge
+                continue
+
+            # Controllo altezza (font size) simile per evitare di fondere dialoghi con pulsanti menu o tag nomi
+            g_height = g_bottom - g_top
+            r_height = r_bottom - r_top
+            h_ratio = g_height / r_height if r_height > 0 else 0
+            if h_ratio < 0.7 or h_ratio > 1.4:
+                continue
+
+            # Sovrapposizione orizzontale
+            overlap_left = max(g_left, r_left)
+            overlap_right = min(g_right, r_right)
+            overlap = max(0.0, overlap_right - overlap_left)
+            min_w = min(g_width, r_width)
+            if overlap / min_w < min_horizontal_overlap_ratio:
+                # Non abbastanza sovrapposti in X: elementi UI diversi
+                continue
+
+            group.append(region)
+            merged_into_group = True
+            break
+
+        if not merged_into_group:
+            groups.append([region])
+
+    result: list[TextRegion] = []
+    for group in groups:
+        if len(group) == 1:
+            result.append(group[0])
+        else:
+            # Ordina dall'alto verso il basso prima di concatenare il testo
+            group_sorted = sorted(group, key=lambda r: _region_bounds(r)[1])
+            result.append(_merge_region_group(group_sorted))
+
+    return result
+
+
 # ══════════════════════════════════════════════════════════════════
 
 class OCRWorker:
@@ -481,8 +573,23 @@ class OCRWorker:
                 except Empty:
                     break
 
-            frame, _changed_cells = item
+            frame, changed_cells = item
             self._latest_frame = frame
+
+            # Rilevamento scene change: se la maggioranza della griglia è
+            # cambiata, azzera il text-delta per forzare un nuovo emit
+            # anche se il nuovo set di testi coincidesse casualmente con
+            # quello precedente (evita label "fantasma" da scene passate).
+            n_cells = len(changed_cells)
+            n_changed = sum(changed_cells)
+            if n_cells > 0 and (n_changed / n_cells) >= config.ocr_scene_change_threshold:
+                if self._prev_text_set:  # Non resettare se già vuoto
+                    logger.debug(
+                        "OCRWorker: scene change rilevato (%d/%d celle cambiate) "
+                        "— reset text-delta",
+                        n_changed, n_cells,
+                    )
+                    self._prev_text_set = frozenset()
 
             # Throttling: non eseguire OCR più spesso di ocr_throttle_ms
             now = time.perf_counter()
@@ -577,9 +684,22 @@ class OCRWorker:
                 max_vertical_offset_em=config.ocr_merge_max_vertical_offset_em,
             )
             logger.debug(
-                "OCRWorker: %d regione/i dopo il merge box adiacenti (da %d)",
+                "OCRWorker: %d regione/i dopo il merge orizzontale (da %d)",
                 len(regions), pre_merge_count,
             )
+
+        if config.ocr_merge_vertical_blocks:
+            pre_vert = len(regions)
+            regions = merge_vertical_blocks(
+                regions,
+                max_line_gap_em=config.ocr_merge_max_line_gap_em,
+            )
+            if len(regions) < pre_vert:
+                logger.debug(
+                    "OCRWorker: %d regione/i dopo il merge verticale (da %d) "
+                    "— dialog box multi-riga unificati",
+                    len(regions), pre_vert,
+                )
 
         current_text_set = frozenset(r.text for r in regions)
         logger.debug(

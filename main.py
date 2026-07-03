@@ -17,8 +17,10 @@ Modalità di avvio:
     python main.py --phase 3 --no-preview     # Solo testo nel terminale
     python main.py --phase 3 --monitor 1      # Usa monitor secondario
 
-  Futura (Phase 4+):
+  Phase 4 / Produzione:
     python main.py                            # Avvio completo con overlay Qt
+    python main.py --phase 4                  # Alias esplicito per Phase 4
+    python main.py --debug                    # Con logging DEBUG
 
 Argomenti principali:
   --monitor  INT    Indice monitor da catturare (default: 0)
@@ -88,6 +90,7 @@ _PROJECT_LOGGERS = (
     "core.ocr",
     "core.translator",
     "core.pipeline",
+    "ui.overlay",
     "__main__",
 )
 
@@ -828,6 +831,88 @@ def _print_banner(title: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════
+# Phase 4: Full Application (Overlay)
+# ══════════════════════════════════════════════════════════════════
+
+def run_full_app(debug: bool = False) -> None:
+    """
+    Avvia l'applicazione completa: pipeline + overlay PyQt6.
+
+    Flusso:
+      1. Abilita DPI-awareness (prima di QApplication)
+      2. Crea QApplication
+      3. Crea OverlayWindow
+      4. Crea TranslationPipeline collegata all'overlay
+      5. Avvia la pipeline
+      6. Esegue app.exec() (event loop Qt)
+      7. Cleanup alla chiusura
+    """
+    import sys
+
+    from PyQt6.QtWidgets import QApplication
+
+    from core.pipeline import TranslationPipeline
+    from ui.overlay import OverlayWindow, enable_dpi_awareness
+
+    _print_banner("Phase 4 — Full Application")
+
+    # ── DPI awareness (PRIMA di QApplication) ─────────────────────
+    enable_dpi_awareness()
+
+    # ── Qt Application ────────────────────────────────────────────
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)  # L'overlay non è una "finestra" utente
+
+    # ── Overlay ───────────────────────────────────────────────────
+    overlay = OverlayWindow()
+
+    # ── Pipeline ──────────────────────────────────────────────────
+    pipeline = TranslationPipeline(overlay_window=overlay)
+
+    logger.info("Avvio pipeline completa...")
+    pipeline.start()
+
+    if debug:
+        _enable_debug_logging()
+
+    print("\n" + "─" * 60)
+    print("  Overlay ATTIVO — il testo tradotto apparirà sullo schermo")
+    print(f"  F10  = mostra/nascondi overlay")
+    print(f"  F9   = toggle sfondo opaco/trasparente")
+    print(f"  Ctrl+C nel terminale per uscire")
+    print("─" * 60 + "\n")
+
+    # ── Ctrl+C handling ───────────────────────────────────────────
+    # signal.signal non funziona bene con il Qt event loop, ma
+    # un QTimer periodico consente a Python di gestire i segnali.
+    import signal as _signal
+
+    def _sigint_handler(signum, frame):
+        logger.info("Ctrl+C ricevuto — chiusura...")
+        app.quit()
+
+    _signal.signal(_signal.SIGINT, _sigint_handler)
+
+    # Timer dummy che risveglia Python periodicamente per controllare
+    # i segnali (altrimenti app.exec() blocca e Ctrl+C non funziona).
+    from PyQt6.QtCore import QTimer
+    _signal_timer = QTimer()
+    _signal_timer.timeout.connect(lambda: None)
+    _signal_timer.start(200)
+
+    # ── Event loop Qt ─────────────────────────────────────────────
+    try:
+        exit_code = app.exec()
+    finally:
+        logger.info("Chiusura pipeline...")
+        pipeline.stop()
+        overlay.close()
+        logger.info("Applicazione terminata")
+
+    sys.exit(exit_code)
+
+
+# ══════════════════════════════════════════════════════════════════
 # CLI
 # ══════════════════════════════════════════════════════════════════
 
@@ -842,8 +927,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         metavar="N",
-        help="Fase da testare (1=capture, 2=ocr, 3=traduzione). "
-             "Omettere per avvio completo (Phase 4+).",
+        help="Fase da testare (1=capture, 2=ocr, 3=traduzione, "
+             "4=app completa). Omettere per avvio completo.",
     )
     p.add_argument(
         "--monitor", "-m",
@@ -900,14 +985,9 @@ if __name__ == "__main__":
             preview=not args.no_preview,
             debug=args.debug,
         )
-    elif args.phase is None:
-        # TODO Phase 4: sostituire con run_full_app() quando disponibile
-        print("Modalità completa non ancora disponibile.")
-        print("  python main.py --phase 1   # test capture pipeline")
-        print("  python main.py --phase 2   # test OCR pipeline")
-        print("  python main.py --phase 3   # test traduzione end-to-end")
-        sys.exit(0)
+    elif args.phase == 4 or args.phase is None:
+        run_full_app(debug=args.debug)
     else:
         print(f"Phase {args.phase} non ancora implementata.")
-        print("Fasi disponibili: 1 (capture), 2 (OCR), 3 (traduzione).")
+        print("Fasi disponibili: 1 (capture), 2 (OCR), 3 (traduzione), 4 (overlay).")
         sys.exit(1)
