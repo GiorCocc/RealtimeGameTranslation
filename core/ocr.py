@@ -57,7 +57,9 @@ class TextRegion:
               a sinistra: ((x1,y1),(x2,y2),(x3,y3),(x4,y4))
         text: testo riconosciuto (già .strip()-ato)
         confidence: punteggio di confidenza 0.0-1.0
-        source: "paddle" oppure "easy" (motore che ha prodotto il risultato)
+        source: "paddle", "easy", oppure "merged" (regione risultante
+                dall'unione di più box adiacenti di sorgenti diverse —
+                vedere merge_adjacent_regions())
     """
 
     bbox: tuple
@@ -80,6 +82,158 @@ class TextRegion:
         xs = [p[0] for p in self.bbox]
         ys = [p[1] for p in self.bbox]
         return (sum(xs) / 4, sum(ys) / 4)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Bounding Box Merging
+# ══════════════════════════════════════════════════════════════════
+#
+# PaddleOCR isola spesso singole parole in bounding box separate (es.
+# "Press" e "Start" come due regioni distinte invece di "Press Start"),
+# perché la sua detection lavora a livello di parola/token, non di frase
+# o riga completa. Passate così com'è a MarianMT, ogni parola viene
+# tradotta SENZA il contesto delle altre, producendo traduzioni prive di
+# senso o palesemente sbagliate (es. "Press" tradotto isolatamente può
+# diventare "Stampa" invece di "Premi").
+#
+# La soluzione qui implementata è puramente geometrica (non NLP): unisce
+# bounding box vicine sulla stessa riga in un'unica regione, sul
+# presupposto ragionevole che parole scritte vicine sulla stessa riga in
+# un'interfaccia di gioco appartengano quasi sempre alla stessa frase o
+# elemento UI (es. "Press Start", "New Game", "HP: 100/100").
+
+def _region_bounds(region: TextRegion) -> tuple[float, float, float, float]:
+    """Restituisce (left, top, right, bottom) della bbox della regione."""
+    xs = [p[0] for p in region.bbox]
+    ys = [p[1] for p in region.bbox]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _merge_region_group(group: list[TextRegion]) -> TextRegion:
+    """
+    Unisce un gruppo di TextRegion (già note per essere adiacenti sulla
+    stessa riga) in un'unica TextRegion.
+
+    - bbox: inviluppo rettangolare (assiale) di tutte le box del gruppo
+    - text: concatenazione dei testi da sinistra a destra, separati da
+      uno spazio
+    - confidence: minimo delle confidenze del gruppo (approccio
+      prudente — la regione più debole determina la confidenza
+      dell'insieme unito)
+    - source: quella comune se tutte le regioni condividono la stessa
+      sorgente, altrimenti "merged"
+    """
+    group_sorted = sorted(group, key=lambda r: _region_bounds(r)[0])
+    bounds = [_region_bounds(r) for r in group_sorted]
+    left = min(b[0] for b in bounds)
+    top = min(b[1] for b in bounds)
+    right = max(b[2] for b in bounds)
+    bottom = max(b[3] for b in bounds)
+    bbox = ((left, top), (right, top), (right, bottom), (left, bottom))
+
+    text = " ".join(r.text for r in group_sorted)
+    confidence = min(r.confidence for r in group_sorted)
+    sources = {r.source for r in group_sorted}
+    source = sources.pop() if len(sources) == 1 else "merged"
+
+    return TextRegion(bbox=bbox, text=text, confidence=confidence, source=source)
+
+
+def merge_adjacent_regions(
+    regions: list[TextRegion],
+    max_gap_em: float,
+    max_vertical_offset_em: float,
+) -> list[TextRegion]:
+    """
+    Unisce bounding box adiacenti sulla stessa riga in un'unica regione.
+
+    Euristica in due passi:
+      1. Raggruppamento per riga: due regioni sono considerate sulla
+         stessa riga se il loro centro verticale differisce per meno di
+         `max_vertical_offset_em` volte l'altezza media delle due box.
+      2. Unione orizzontale: all'interno di ogni riga, le regioni
+         vengono ordinate da sinistra a destra e unite finché il gap
+         orizzontale (bordo destro della precedente → bordo sinistro
+         della successiva) resta sotto `max_gap_em` volte l'altezza
+         media delle due box confrontate.
+
+    Le soglie sono relative all'altezza del testo ("em") invece che in
+    pixel assoluti, per restare valide indipendentemente dalla
+    risoluzione dello schermo o dal downscale applicato prima dell'OCR.
+
+    Deliberatamente NON unisce:
+      - regioni su righe diverse (titoli e paragrafi restano separati)
+      - regioni sulla stessa riga ma troppo distanti orizzontalmente
+        (evita di fondere elementi UI indipendenti che capitano sulla
+        stessa riga, es. "HP: 100" e "MP: 50" in un HUD)
+
+    Args:
+        regions: TextRegion già filtrate (confidenza/lunghezza minima)
+        max_gap_em: gap orizzontale massimo, in multipli dell'altezza
+            media delle due box, per considerarle parte della stessa
+            frase (vedere config.ocr_merge_max_gap_em)
+        max_vertical_offset_em: tolleranza verticale, in multipli
+            dell'altezza media delle due box, per considerare due
+            regioni sulla stessa riga (vedere
+            config.ocr_merge_max_vertical_offset_em)
+
+    Returns:
+        Nuova lista di TextRegion, con le regioni adiacenti unite.
+        Le regioni che non vengono unite a nessun'altra sono restituite
+        invariate (stesso oggetto).
+    """
+    if not regions:
+        return []
+
+    # Ordina per (centro_y, sinistra): raggruppa naturalmente le
+    # regioni della stessa riga in sequenze contigue, permettendo un
+    # singolo passaggio sequenziale per il raggruppamento in righe.
+    sorted_regions = sorted(
+        regions, key=lambda r: (r.center[1], _region_bounds(r)[0])
+    )
+
+    rows: list[list[TextRegion]] = []
+    for region in sorted_regions:
+        region_height = region.height or 1.0
+        placed = False
+        for row in rows:
+            ref = row[-1]
+            ref_height = ref.height or 1.0
+            avg_height = (region_height + ref_height) / 2
+            if abs(region.center[1] - ref.center[1]) <= max_vertical_offset_em * avg_height:
+                row.append(region)
+                placed = True
+                break
+        if not placed:
+            rows.append([region])
+
+    merged: list[TextRegion] = []
+    for row in rows:
+        row_sorted = sorted(row, key=lambda r: _region_bounds(r)[0])
+        current_group: list[TextRegion] = [row_sorted[0]]
+
+        for region in row_sorted[1:]:
+            prev = current_group[-1]
+            _, _, prev_right, _ = _region_bounds(prev)
+            left, _, _, _ = _region_bounds(region)
+            gap = left - prev_right
+            avg_height = ((prev.height or 1.0) + (region.height or 1.0)) / 2
+
+            if gap <= max_gap_em * avg_height:
+                current_group.append(region)
+            else:
+                merged.append(
+                    current_group[0] if len(current_group) == 1
+                    else _merge_region_group(current_group)
+                )
+                current_group = [region]
+
+        merged.append(
+            current_group[0] if len(current_group) == 1
+            else _merge_region_group(current_group)
+        )
+
+    return merged
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -413,6 +567,18 @@ class OCRWorker:
 
             regions.append(
                 TextRegion(bbox=bbox, text=text, confidence=conf, source=source)
+            )
+
+        pre_merge_count = len(regions)
+        if config.ocr_merge_adjacent_boxes:
+            regions = merge_adjacent_regions(
+                regions,
+                max_gap_em=config.ocr_merge_max_gap_em,
+                max_vertical_offset_em=config.ocr_merge_max_vertical_offset_em,
+            )
+            logger.debug(
+                "OCRWorker: %d regione/i dopo il merge box adiacenti (da %d)",
+                len(regions), pre_merge_count,
             )
 
         current_text_set = frozenset(r.text for r in regions)
