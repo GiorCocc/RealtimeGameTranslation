@@ -295,7 +295,8 @@ game-translator/
 - **Output atteso**: latenza totale <300ms su CPU, <100ms su GPU
 
 ### Fase 6 — Config Panel e UX
-- `settings.py`: selezione lingua, monitor, regione, soglie
+- `settings.py`: selezione lingua, monitor (o finestra specifica, stile OBS), regione, soglie, dimensione carattere...
+- nel pannellino di controllo vedere le risorse disponibili (CPU, GPU, RAM usata con previsione dell'impatto)
 - Hotkey globali (`keyboard`): toggle overlay, toggle modalità
 - `tray.py`: icona tray per start/stop/settings
 - **Output atteso**: app completa e usabile senza toccare il codice

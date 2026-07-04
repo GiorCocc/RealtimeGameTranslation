@@ -28,5 +28,10 @@ keyboard                 # Hotkey globali (F9/F10) senza focus sull'app
 pystray                  # Icona system tray
 pillow                   # Richiesto da pystray per l'icona
 
+# ── Settings panel (Phase 6) ──────────────────────────────────────
+psutil                   # Monitor risorse: CPU % e RAM nel pannello Impostazioni
+# wmi                    # Opzionale: nome scheda video nel pannello Risorse (Windows,
+                         # "pip install wmi"). Nessuna % utilizzo GPU per AMD senza ROCm.
+
 # ── Other ────────────────────────────────────────────────────────────
 sacremoses

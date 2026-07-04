@@ -796,30 +796,6 @@ def _run_phase3_preview(pipeline, output: list) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════
-# Full Application (Phase 4+)
-# ══════════════════════════════════════════════════════════════════
-
-def run_full_app() -> None:
-    """
-    TODO Phase 4 — Avvio completo dell'applicazione con overlay Qt.
-
-    Sequenza:
-      1. Carica settings da settings.json
-      2. Avvia QApplication
-      3. Crea OverlayWindow
-      4. Avvia TranslationPipeline (collega a OverlayWindow via signal)
-      5. Registra hotkey globali (keyboard)
-      6. Avvia TrayIcon
-      7. QApplication.exec() — event loop Qt (blocca qui)
-      8. Al quit: pipeline.stop(), tray.stop()
-    """
-    raise NotImplementedError(
-        "Phase 4: implementare run_full_app() dopo aver completato "
-        "OverlayWindow, OCRWorker e TranslationWorker."
-    )
-
-
-# ══════════════════════════════════════════════════════════════════
 # Utilities
 # ══════════════════════════════════════════════════════════════════
 
@@ -849,12 +825,21 @@ def run_full_app(debug: bool = False) -> None:
     """
     import sys
 
+    from PyQt6.QtCore import QTimer, QObject, pyqtSignal
     from PyQt6.QtWidgets import QApplication
 
+    from config import config
     from core.pipeline import TranslationPipeline
     from ui.overlay import OverlayWindow, enable_dpi_awareness
+    from ui.settings import load_settings
 
-    _print_banner("Phase 4 — Full Application")
+    _print_banner("Phase 4/6 — Full Application")
+
+    # ── Settings persistiti (Phase 6) ─────────────────────────────
+    # Carica settings.json PRIMA di creare overlay/pipeline, così tutti
+    # gli stadi partono già con i valori dell'ultima sessione (lingua,
+    # monitor/finestra, soglie OCR, aspetto overlay, hotkey).
+    load_settings()
 
     # ── DPI awareness (PRIMA di QApplication) ─────────────────────
     enable_dpi_awareness()
@@ -875,10 +860,59 @@ def run_full_app(debug: bool = False) -> None:
     if debug:
         _enable_debug_logging()
 
+    # ── System tray (Phase 6) ──────────────────────────────────────
+    # Le callback del tray arrivano dal thread di pystray, che è un thread
+    # nativo non-Qt. Per comunicare in modo thread-safe ed essere sicuri
+    # che l'esecuzione rientri nel thread principale Qt (per mostrare finestre
+    # modali o aggiornare la GUI), usiamo un QObject con pyqtSignal.
+    tray = None
+    try:
+        from ui.tray import TrayIcon
+
+        class TraySignalBridge(QObject):
+            toggle_overlay_sig = pyqtSignal()
+            open_settings_sig = pyqtSignal()
+            show_stats_sig = pyqtSignal()
+            quit_sig = pyqtSignal()
+
+        bridge = TraySignalBridge()
+        bridge.toggle_overlay_sig.connect(overlay.toggle_overlay)
+        bridge.open_settings_sig.connect(lambda: _open_settings_dialog(overlay, pipeline))
+        bridge.show_stats_sig.connect(lambda: _show_stats_dialog(pipeline))
+        bridge.quit_sig.connect(app.quit)
+
+        def _tray_toggle() -> None:
+            bridge.toggle_overlay_sig.emit()
+
+        def _tray_open_settings() -> None:
+            bridge.open_settings_sig.emit()
+
+        def _tray_show_stats() -> None:
+            bridge.show_stats_sig.emit()
+
+        def _tray_quit() -> None:
+            bridge.quit_sig.emit()
+
+        tray = TrayIcon(
+            on_toggle=_tray_toggle,
+            on_settings=_tray_open_settings,
+            on_quit=_tray_quit,
+            on_stats=_tray_show_stats,
+            overlay_active=True,
+        )
+        tray.run_detached()
+        logger.info("System tray avviata")
+    except Exception:
+        logger.exception(
+            "Impossibile avviare la system tray (pystray/Pillow mancanti?) — "
+            "l'app continua senza icona tray, uso hotkey/Ctrl+C"
+        )
+
     print("\n" + "─" * 60)
     print("  Overlay ATTIVO — il testo tradotto apparirà sullo schermo")
-    print(f"  F10  = mostra/nascondi overlay")
-    print(f"  F9   = toggle sfondo opaco/trasparente")
+    print(f"  {config.hotkey_toggle_overlay.upper()}  = mostra/nascondi overlay")
+    print(f"  {config.hotkey_toggle_opaque.upper()}   = toggle sfondo opaco/trasparente")
+    print("  Icona nella system tray per Impostazioni/Statistiche/Esci")
     print(f"  Ctrl+C nel terminale per uscire")
     print("─" * 60 + "\n")
 
@@ -895,7 +929,6 @@ def run_full_app(debug: bool = False) -> None:
 
     # Timer dummy che risveglia Python periodicamente per controllare
     # i segnali (altrimenti app.exec() blocca e Ctrl+C non funziona).
-    from PyQt6.QtCore import QTimer
     _signal_timer = QTimer()
     _signal_timer.timeout.connect(lambda: None)
     _signal_timer.start(200)
@@ -907,9 +940,61 @@ def run_full_app(debug: bool = False) -> None:
         logger.info("Chiusura pipeline...")
         pipeline.stop()
         overlay.close()
+        if tray is not None:
+            tray.stop()
         logger.info("Applicazione terminata")
 
     sys.exit(exit_code)
+
+
+def _open_settings_dialog(overlay, pipeline) -> None:
+    """
+    Apre il pannello Impostazioni (sempre nel thread Qt) e applica le
+    conseguenze dell'eventuale conferma: riavvio pipeline se necessario
+    (nuova lingua/monitor/finestra/fps) e ri-registrazione hotkey se
+    cambiati.
+    """
+    from PyQt6.QtWidgets import QDialog
+
+    from ui.settings import SettingsDialog
+
+    dialog = SettingsDialog(parent=None)
+    if dialog.exec() == QDialog.DialogCode.Accepted:
+        logger.info("Impostazioni aggiornate dall'utente")
+        if dialog.hotkeys_changed:
+            overlay.apply_hotkey_changes()
+        overlay.apply_style_changes()
+        if dialog.requires_restart:
+            logger.info("Riavvio pipeline per applicare le nuove impostazioni...")
+            pipeline.restart()
+
+
+def _show_stats_dialog(pipeline) -> None:
+    """Mostra un semplice QMessageBox con le statistiche aggregate correnti."""
+    from PyQt6.QtWidgets import QMessageBox
+
+    s = pipeline.stats
+    cap_s = s.get("capture", {})
+    ocr_s = s.get("ocr", {})
+    tr_s = s.get("translation", {})
+
+    text = (
+        f"Cattura:  fps_eff={cap_s.get('effective_fps', 0):.1f}  "
+        f"catturati={cap_s.get('frames_captured', 0)}  "
+        f"droppati={cap_s.get('frames_dropped', 0)}\n\n"
+        f"OCR:  frame_processati={ocr_s.get('frames_processed', 0)}  "
+        f"regioni={ocr_s.get('regions_emitted', 0)}  "
+        f"avg_ms={ocr_s.get('avg_ocr_ms', 0)}\n\n"
+        f"Traduzione:  batch={tr_s.get('batches_processed', 0)}  "
+        f"cache_hit={tr_s.get('cache_hit_rate_pct', 0)}%  "
+        f"avg_ms={tr_s.get('avg_translation_ms', 0)}  "
+        f"device={tr_s.get('device', '?')}"
+    )
+
+    box = QMessageBox()
+    box.setWindowTitle("Game Translator — Statistiche")
+    box.setText(text)
+    box.exec()
 
 
 # ══════════════════════════════════════════════════════════════════

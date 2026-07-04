@@ -189,6 +189,7 @@ class TranslationLabel(QLabel):
 
     def _apply_style(self) -> None:
         """Applica lo stile CSS alla label in base alla modalità corrente."""
+        self._bg_alpha = config.overlay_bg_alpha
         alpha = 255 if self._opaque_mode else self._bg_alpha
         bg_color = QColor(20, 20, 30, alpha)
         text_color = QColor(240, 240, 245)
@@ -427,6 +428,38 @@ class OverlayWindow(QWidget):
             keyboard.unhook_all_hotkeys()
         except Exception:
             logger.exception("Errore nella rimozione degli hotkey")
+
+    def apply_hotkey_changes(self) -> None:
+        """
+        Phase 6 — Ri-registra gli hotkey globali con i valori correnti di
+        `config` (hotkey_toggle_overlay / hotkey_toggle_opaque).
+
+        Da chiamare dopo che il pannello Settings ha scritto nuovi valori
+        nel singleton config: `keyboard.add_hotkey` cattura la stringa
+        dell'hotkey al momento della registrazione, quindi un cambio a
+        runtime richiede sempre un unhook + re-register esplicito.
+        """
+        self._unregister_hotkeys()
+        self._register_hotkeys()
+        logger.info(
+            "OverlayWindow: hotkey aggiornati (%s = toggle overlay, %s = toggle opacità)",
+            config.hotkey_toggle_overlay.upper(),
+            config.hotkey_toggle_opaque.upper(),
+        )
+
+    def apply_style_changes(self) -> None:
+        """
+        Phase 6 — Applica le modifiche di stile (font family, font size, bg alpha)
+        a tutte le label correntemente attive.
+        """
+        logger.info(
+            "OverlayWindow: applicazione modifiche di stile (font=%s, size=%d, alpha=%d)",
+            config.overlay_font_family,
+            config.overlay_font_size,
+            config.overlay_bg_alpha,
+        )
+        for entry in self._entries.values():
+            entry.label._apply_style()
 
     def _on_hotkey_toggle_overlay(self) -> None:
         """Callback hotkey F10: mostra/nasconde l'overlay."""

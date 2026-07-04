@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 # Root del progetto (cartella che contiene questo file)
 ROOT_DIR = Path(__file__).parent
@@ -25,6 +26,21 @@ class Config:
     # ── Capture ───────────────────────────────────────────────────
     monitor_index: int = 0          # Indice monitor da catturare (0 = primario)
     capture_fps: int = 30           # Target FPS per dxcam
+
+    # ── Capture: modalità (Phase 6) ────────────────────────────────
+    # "monitor" → cattura l'intero monitor indicato da `monitor_index`
+    # "window"  → cattura solo il rettangolo della finestra il cui titolo
+    #             contiene `capture_window_title` (stile OBS "Window Capture").
+    #             Il monitor su cui si trova la finestra viene rilevato
+    #             automaticamente ad ogni avvio/riavvio della pipeline;
+    #             `monitor_index` viene ignorato in questa modalità.
+    capture_mode: str = "monitor"          # "monitor" | "window"
+    capture_window_title: str = ""         # Sottostringa (case-insensitive) del titolo finestra
+    # Regione esplicita (left, top, right, bottom) in coordinate assolute
+    # dello schermo. Se impostata ha priorità sulla modalità "window"/"monitor"
+    # per catturare una porzione custom (es. solo l'area di gioco in una
+    # finestra con bordi/HUD dell'OS). None = nessuna regione custom.
+    capture_region: Optional[tuple] = None
 
     # ── Frame differencing ────────────────────────────────────────
     # Lo schermo viene diviso in griglia rows×cols.
