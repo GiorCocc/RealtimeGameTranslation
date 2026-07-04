@@ -1,6 +1,6 @@
 # Realtime Game Translation Overlay
 
-[![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Python Version](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)](#)
 [![Status](https://img.shields.io/badge/status-active-brightgreen.svg)](#)
@@ -67,7 +67,7 @@ A differenza di altri strumenti, l'applicazione:
 
 ## 🛠️ Tech Stack
 
-- **Linguaggio**: Python 3.11+
+- **Linguaggio**: Python 3.12+
 - **Cattura Schermo**: `dxcam`
 - **Computer Vision & Elaborazione**: `numpy`, `opencv-python`, `pillow`
 - **OCR Engines**: `paddleocr` (PaddlePaddle), `easyocr` (PyTorch)
