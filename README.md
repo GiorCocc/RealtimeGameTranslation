@@ -245,15 +245,3 @@ I contributi sono sempre benvenuti! Se desideri proporre miglioramenti o segnala
 ## 📄 Licenza
 
 Questo progetto è distribuito sotto licenza MIT. 
-
-> [!NOTE]
-> Il file contenente il testo completo della licenza (`LICENSE`) non è attualmente presente nel repository e dovrebbe essere aggiunto alla directory radice.
-
----
-
-## ✉️ Contatti e Credits
-
-- **Autore**: GiorCocc - [GitHub Profile](https://github.com/GiorCocc)
-- **Sito di Riferimento**: [RealtimeGameTranslation Repo](https://github.com/GiorCocc/RealtimeGameTranslation)
-
-*Grazie a tutti i creatori e manutentori dei pacchetti open-source utilizzati in questa applicazione (PaddleOCR, EasyOCR, Hugging Face Transformers, PyQt6 e dxcam).*
