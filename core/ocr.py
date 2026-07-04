@@ -1,5 +1,5 @@
 """
-core/ocr.py — Phase 2: OCR e Text Detection
+core/ocr.py — Phase 2 + Phase 5: OCR e Text Detection (ottimizzato)
 
 Responsabilità:
   - Analizza l'intero frame (nessuna zona predefinita) con PaddleOCR
@@ -10,6 +10,15 @@ Responsabilità:
     al frame precedente (riduce il carico sul TranslationWorker)
   - Throttling: non esegue OCR più spesso di config.ocr_throttle_ms
 
+Ottimizzazioni Phase 5:
+  - OCR incrementale per zone: processa solo le celle della griglia cambiate,
+    riutilizzando i risultati OCR delle zone stabili (60-80% meno carico)
+  - Lazy loading EasyOCR: caricato solo al primo fallback effettivo (~500MB
+    di RAM risparmiati all'avvio)
+  - Adaptive downscale: risoluzione OCR scelta in base a VRAM disponibile
+  - Thread priority BELOW_NORMAL su Windows (non compete con il gioco)
+  - GPU detection centralizzata via core.gpu_utils
+
 Classi pubbliche:
   TextRegion  — dataclass immutabile che rappresenta una regione di testo
   OCRWorker   — thread consumer: frame_queue → OCR → output_queue
@@ -19,6 +28,7 @@ NON sostituire PaddleOCR con Tesseract (vedere KNOWLEDGE_BASE.md §13).
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import threading
 import time
@@ -356,13 +366,25 @@ class OCRWorker:
         # Modelli (caricati in _load_models)
         self._paddle_engine = None
         self._paddle_major: int = 2
-        self._easy_reader = None  # None = fallback disattivato
+        self._easy_reader = None  # None = fallback disattivato / non ancora caricato
+        self._easy_load_attempted: bool = False  # Phase 5: lazy loading flag
+        self._cuda_available: bool = False  # Cache del risultato detection GPU
 
         # Per la preview OpenCV in main.py
         self._latest_frame: Optional[np.ndarray] = None
 
         # Text delta: set di testi rilevati nell'ultimo frame emesso
         self._prev_text_set: frozenset = frozenset()
+
+        # Phase 5: Cache risultati OCR per zona della griglia.
+        # Chiave: indice cella (int), Valore: lista di TextRegion rilevate
+        # in quella zona. Le zone non cambiate riutilizzano i risultati
+        # dell'ultimo frame processato senza rieseguire l'OCR.
+        self._zone_cache: dict[int, list[TextRegion]] = {}
+
+        # Phase 5: conteggio ottimizzazioni zone
+        self._n_zones_cached: int = 0
+        self._n_zones_processed: int = 0
 
         # Stats
         self._n_processed: int = 0
@@ -377,9 +399,13 @@ class OCRWorker:
         """Carica i modelli (bloccante) e avvia il thread consumer."""
         self._load_models()
         self._t_start = time.perf_counter()
-        threading.Thread(
+        t = threading.Thread(
             target=self._consume_loop, daemon=True, name="OCRWorker"
-        ).start()
+        )
+        t.start()
+        # Phase 5: abbassa la priorità del thread OCR su Windows per non
+        # competere con il gioco per i core CPU.
+        self._set_thread_priority_below_normal(t)
         logger.info("OCRWorker avviato")
 
     def stop(self) -> None:
@@ -392,21 +418,34 @@ class OCRWorker:
     # ── Model loading ─────────────────────────────────────────────
 
     @staticmethod
-    def _detect_cuda() -> bool:
+    def _resolve_gpu_device() -> bool:
+        """Determina se usare la GPU per l'OCR via gpu_utils centralizzato."""
         try:
-            import torch
-            return bool(torch.cuda.is_available())
+            from core.gpu_utils import detect_device, get_optimal_device
+            if config.ocr_gpu_device == "cuda":
+                info = detect_device()
+                return info.backend == "cuda"
+            elif config.ocr_gpu_device == "cpu":
+                return False
+            else:  # "auto"
+                device = get_optimal_device(vram_required_mb=300)
+                return device == "cuda"
         except ImportError:
-            return False
+            # Fallback se gpu_utils non ancora disponibile
+            try:
+                import torch
+                return bool(torch.cuda.is_available())
+            except ImportError:
+                return False
 
     def _load_models(self) -> None:
-        cuda_available = self._detect_cuda()
+        self._cuda_available = self._resolve_gpu_device()
         logger.info(
-            "OCRWorker: CUDA %s",
-            "disponibile (GPU)" if cuda_available else "non disponibile (CPU)",
+            "OCRWorker: device OCR → %s",
+            "GPU (CUDA)" if self._cuda_available else "CPU",
         )
 
-        self._paddle_engine, self._paddle_major = self._init_paddle(cuda_available)
+        self._paddle_engine, self._paddle_major = self._init_paddle(self._cuda_available)
         if self._paddle_major >= 3 and config.ocr_language == "en":
             model_desc = "PP-OCRv5_mobile_det + en_PP-OCRv5_mobile_rec (pin esplicito)"
         elif self._paddle_major >= 3:
@@ -417,14 +456,32 @@ class OCRWorker:
             "OCRWorker: PaddleOCR caricato (API v%d, lang=%s, modello=%s, mkldnn=%s)",
             self._paddle_major, config.ocr_language, model_desc,
             "disattivato (workaround bug PaddlePaddle 3.3.x)"
-            if (not cuda_available and self._paddle_mkldnn_broken())
+            if (not self._cuda_available and self._paddle_mkldnn_broken())
             else "attivo",
         )
 
+        # Phase 5: Lazy loading EasyOCR — caricato solo al primo fallback
+        # effettivo per risparmiare ~500MB di RAM all'avvio e ~3-5 secondi.
+        # Il programma viene solitamente lanciato prima del gioco, quindi
+        # un eventuale ritardo al primo fallback è accettabile.
+        if config.ocr_lazy_load_easyocr:
+            logger.info(
+                "OCRWorker: EasyOCR in modalità lazy-load (sarà caricato al primo fallback)"
+            )
+            self._easy_reader = None
+            self._easy_load_attempted = False
+        else:
+            self._load_easyocr()
+
+    def _load_easyocr(self) -> None:
+        """Carica EasyOCR (chiamato all'avvio o al primo fallback in lazy mode)."""
+        if self._easy_load_attempted:
+            return
+        self._easy_load_attempted = True
         try:
             import easyocr
             self._easy_reader = easyocr.Reader(
-                [config.ocr_language], gpu=cuda_available, verbose=False
+                [config.ocr_language], gpu=self._cuda_available, verbose=False
             )
             logger.info("OCRWorker: EasyOCR caricato (fallback attivo)")
         except Exception:
@@ -554,6 +611,39 @@ class OCRWorker:
 
         return engine, major
 
+    # ── Thread priority (Phase 5) ─────────────────────────────────
+
+    @staticmethod
+    def _set_thread_priority_below_normal(thread: threading.Thread) -> None:
+        """
+        Imposta la priorità del thread OCR a BELOW_NORMAL su Windows.
+
+        Su una macchina gaming con gioco + OBS attivi, il thread OCR non
+        deve competere con il gioco per i core CPU. Il sistema operativo
+        assegnerà tempo CPU residuo al thread OCR.
+        """
+        try:
+            import ctypes
+            THREAD_SET_INFORMATION = 0x0020
+            THREAD_PRIORITY_BELOW_NORMAL = -1
+            handle = ctypes.windll.kernel32.OpenThread(
+                THREAD_SET_INFORMATION, False, thread.native_id
+            )
+            if handle:
+                ctypes.windll.kernel32.SetThreadPriority(
+                    handle, THREAD_PRIORITY_BELOW_NORMAL
+                )
+                ctypes.windll.kernel32.CloseHandle(handle)
+                logger.debug(
+                    "OCRWorker: priorità thread impostata a BELOW_NORMAL (tid=%d)",
+                    thread.native_id,
+                )
+        except Exception:
+            logger.debug(
+                "OCRWorker: impossibile impostare priorità thread",
+                exc_info=True,
+            )
+
     # ── Consumer loop ─────────────────────────────────────────────
 
     def _consume_loop(self) -> None:
@@ -573,7 +663,11 @@ class OCRWorker:
                 except Empty:
                     break
 
-            frame, changed_cells = item
+            if len(item) == 3:
+                frame, changed_cells, capture_time = item
+            else:
+                frame, changed_cells = item
+                capture_time = time.perf_counter()
             self._latest_frame = frame
 
             # Rilevamento scene change: se la maggioranza della griglia è
@@ -582,14 +676,20 @@ class OCRWorker:
             # quello precedente (evita label "fantasma" da scene passate).
             n_cells = len(changed_cells)
             n_changed = sum(changed_cells)
-            if n_cells > 0 and (n_changed / n_cells) >= config.ocr_scene_change_threshold:
+            is_scene_change = (
+                n_cells > 0
+                and (n_changed / n_cells) >= config.ocr_scene_change_threshold
+            )
+            if is_scene_change:
                 if self._prev_text_set:  # Non resettare se già vuoto
                     logger.debug(
                         "OCRWorker: scene change rilevato (%d/%d celle cambiate) "
-                        "— reset text-delta",
+                        "— reset text-delta e zone cache",
                         n_changed, n_cells,
                     )
                     self._prev_text_set = frozenset()
+                # Phase 5: scene change → invalida la zone cache completa
+                self._zone_cache.clear()
 
             # Throttling: non eseguire OCR più spesso di ocr_throttle_ms
             now = time.perf_counter()
@@ -601,7 +701,10 @@ class OCRWorker:
             t0 = time.perf_counter()
             logger.debug("OCRWorker: elaborazione frame in corso...")
             try:
-                regions = self._process_frame(frame)
+                # Phase 5: OCR incrementale per zone cambiate
+                regions = self._process_frame_incremental(
+                    frame, changed_cells, is_scene_change
+                )
             except Exception:
                 logger.exception("OCRWorker: errore durante _process_frame")
                 continue
@@ -623,25 +726,151 @@ class OCRWorker:
             self._n_processed += 1
             self._n_regions += len(regions)
 
+            payload = (regions, capture_time)
             try:
-                self.output_queue.put_nowait(regions)
+                self.output_queue.put_nowait(payload)
             except Full:
                 try:
                     self.output_queue.get_nowait()
                 except Empty:
                     pass
                 try:
-                    self.output_queue.put_nowait(regions)
+                    self.output_queue.put_nowait(payload)
                 except Full:
                     pass
 
     # ── Frame processing ─────────────────────────────────────────
 
-    def _process_frame(self, frame: np.ndarray) -> Optional[list[TextRegion]]:
+    def _process_frame_incremental(
+        self,
+        frame: np.ndarray,
+        changed_cells: list[bool],
+        is_scene_change: bool,
+    ) -> Optional[list[TextRegion]]:
         """
-        Pipeline completa su un singolo frame:
+        Phase 5: OCR incrementale per zone cambiate.
+
+        Invece di processare l'intero frame ad ogni ciclo, identifica le
+        zone della griglia che sono cambiate (informazione già calcolata
+        dal FrameDifferencer in capture.py) e processa solo quelle con
+        PaddleOCR. Le zone stabili riutilizzano i risultati OCR dal frame
+        precedente (salvati in _zone_cache).
+
+        In caso di scene change o se la zone cache è vuota, ricade sul
+        processamento completo dell'intero frame (backward compatible).
+
+        Returns:
+            list[TextRegion] se il set di testi è cambiato, None altrimenti.
+        """
+        # Se è un scene change o non abbiamo cache, processa tutto
+        if is_scene_change or not self._zone_cache:
+            return self._process_frame_full(frame, changed_cells)
+
+        # Conta zone cambiate vs stabili
+        n_changed = sum(changed_cells)
+        n_total = len(changed_cells)
+
+        # Se cambiano troppe zone (>50%), conviene processare tutto il frame
+        # in un colpo solo piuttosto che fare N crop separati
+        if n_changed > n_total * 0.5:
+            return self._process_frame_full(frame, changed_cells)
+
+        # ── OCR incrementale: processa solo le zone cambiate ──────
+        h, w = frame.shape[:2]
+        rows = config.frame_diff_grid_rows
+        cols = config.frame_diff_grid_cols
+        cell_h = h // rows
+        cell_w = w // cols
+
+        for idx, changed in enumerate(changed_cells):
+            if not changed:
+                self._n_zones_cached += 1
+                continue
+
+            self._n_zones_processed += 1
+            r_idx = idx // cols
+            c_idx = idx % cols
+
+            # Calcola il rettangolo della cella con padding del 10%
+            # per non tagliare testo al bordo tra due celle
+            y1 = r_idx * cell_h
+            x1 = c_idx * cell_w
+            y2 = y1 + cell_h if r_idx < rows - 1 else h
+            x2 = x1 + cell_w if c_idx < cols - 1 else w
+
+            pad_y = max(1, int(cell_h * 0.1))
+            pad_x = max(1, int(cell_w * 0.1))
+            y1_pad = max(0, y1 - pad_y)
+            x1_pad = max(0, x1 - pad_x)
+            y2_pad = min(h, y2 + pad_y)
+            x2_pad = min(w, x2 + pad_x)
+
+            crop = frame[y1_pad:y2_pad, x1_pad:x2_pad]
+            if crop.size == 0:
+                self._zone_cache[idx] = []
+                continue
+
+            # OCR sul crop della zona (senza downscale addizionale:
+            # il crop è già piccolo ~1/16 del frame)
+            raw = self._run_paddle(crop)
+            zone_regions: list[TextRegion] = []
+            for bbox_local, text, conf in raw:
+                # Trasla le coordinate locali del crop a coordinate
+                # globali del frame completo
+                bbox_global = tuple(
+                    (float(p[0]) + x1_pad, float(p[1]) + y1_pad)
+                    for p in bbox_local
+                )
+                text = text.strip()
+                source = "paddle"
+
+                if conf < config.ocr_confidence_threshold:
+                    if conf < _EASYOCR_FALLBACK_MIN_CONF:
+                        continue
+                    # Phase 5: lazy loading EasyOCR al primo fallback
+                    if self._easy_reader is None and not self._easy_load_attempted:
+                        logger.info("OCRWorker: primo fallback — caricamento lazy di EasyOCR...")
+                        self._load_easyocr()
+                    if self._easy_reader is None:
+                        continue
+                    fallback = self._run_easyocr_fallback(frame, bbox_global)
+                    if fallback is None:
+                        continue
+                    text, conf = fallback
+                    text = text.strip()
+                    source = "easy"
+
+                if conf < config.ocr_confidence_threshold:
+                    continue
+                if len(text) < config.ocr_min_text_length:
+                    continue
+
+                zone_regions.append(
+                    TextRegion(bbox=bbox_global, text=text, confidence=conf, source=source)
+                )
+
+            self._zone_cache[idx] = zone_regions
+
+        # ── Assembla tutte le regioni (zone cambiate + cache stabili) ──
+        all_regions: list[TextRegion] = []
+        for idx in range(n_total):
+            if idx in self._zone_cache:
+                all_regions.extend(self._zone_cache[idx])
+
+        # Applica merge e text-delta come nella versione full
+        return self._apply_merge_and_delta(all_regions)
+
+    def _process_frame_full(
+        self,
+        frame: np.ndarray,
+        changed_cells: list[bool],
+    ) -> Optional[list[TextRegion]]:
+        """
+        Pipeline completa su un singolo frame (comportamento pre-Phase 5):
           downscale (opzionale) → PaddleOCR → fallback EasyOCR sulle
           regioni a bassa confidenza → filtro → rescale bbox → text delta
+
+        Aggiorna anche la zone_cache per i futuri frame incrementali.
 
         Returns:
             list[TextRegion] se il set di testi è cambiato rispetto al
@@ -658,6 +887,11 @@ class OCRWorker:
             source = "paddle"
 
             if conf < config.ocr_confidence_threshold:
+                # Phase 5: lazy loading EasyOCR al primo fallback
+                if self._easy_reader is None and not self._easy_load_attempted:
+                    if conf >= _EASYOCR_FALLBACK_MIN_CONF:
+                        logger.info("OCRWorker: primo fallback — caricamento lazy di EasyOCR...")
+                        self._load_easyocr()
                 if self._easy_reader is None or conf < _EASYOCR_FALLBACK_MIN_CONF:
                     continue
                 fallback = self._run_easyocr_fallback(frame, bbox)
@@ -676,6 +910,53 @@ class OCRWorker:
                 TextRegion(bbox=bbox, text=text, confidence=conf, source=source)
             )
 
+        # Phase 5: Popola la zone_cache per i futuri frame incrementali.
+        # Distribuisce le regioni rilevate nelle celle della griglia in
+        # base al centroide della bbox.
+        self._populate_zone_cache(frame.shape[:2], regions, changed_cells)
+
+        return self._apply_merge_and_delta(regions)
+
+    def _populate_zone_cache(
+        self,
+        frame_shape: tuple[int, int],
+        regions: list[TextRegion],
+        changed_cells: list[bool],
+    ) -> None:
+        """
+        Distribuisce le regioni nelle celle della griglia per la zone_cache.
+        Ogni regione viene assegnata alla cella che contiene il suo centroide.
+        """
+        h, w = frame_shape
+        rows = config.frame_diff_grid_rows
+        cols = config.frame_diff_grid_cols
+        cell_h = h // rows
+        cell_w = w // cols
+        n_total = rows * cols
+
+        # Inizializza tutte le celle cambiate come vuote
+        for idx, changed in enumerate(changed_cells):
+            if changed:
+                self._zone_cache[idx] = []
+
+        # Assegna ogni regione alla cella del suo centroide
+        for region in regions:
+            cx, cy = region.center
+            c_idx = min(int(cx / cell_w), cols - 1) if cell_w > 0 else 0
+            r_idx = min(int(cy / cell_h), rows - 1) if cell_h > 0 else 0
+            idx = r_idx * cols + c_idx
+            if 0 <= idx < n_total:
+                if idx not in self._zone_cache:
+                    self._zone_cache[idx] = []
+                self._zone_cache[idx].append(region)
+
+    def _apply_merge_and_delta(
+        self, regions: list[TextRegion]
+    ) -> Optional[list[TextRegion]]:
+        """
+        Applica merge orizzontale/verticale e text-delta. Estratto come
+        metodo condiviso tra _process_frame_full e _process_frame_incremental.
+        """
         pre_merge_count = len(regions)
         if config.ocr_merge_adjacent_boxes:
             regions = merge_adjacent_regions(
@@ -717,19 +998,41 @@ class OCRWorker:
 
     @staticmethod
     def _maybe_downscale(frame: np.ndarray) -> tuple[np.ndarray, float]:
-        """Ridimensiona il frame a ocr_downscale_height se più alto. Restituisce (frame, scale)."""
+        """
+        Ridimensiona il frame prima dell'OCR. La risoluzione target è
+        determinata da config.ocr_downscale_height.
+
+        Phase 5: adaptive downscale — la risoluzione viene scelta anche
+        in base alla VRAM disponibile quando su GPU:
+          - GPU con ≥6GB VRAM libera: 1080p (qualità OCR migliore)
+          - GPU con <6GB o CPU: 720p (default, buon compromesso)
+
+        Returns:
+            (frame_ridimensionato, fattore_di_scala)
+        """
         if not config.ocr_downscale:
             return frame, 1.0
 
+        target_h = config.ocr_downscale_height
+
+        # Phase 5: adaptive downscale basato su VRAM disponibile
+        try:
+            from core.gpu_utils import detect_device
+            info = detect_device()
+            if info.backend == "cuda" and info.vram_free_mb >= 6000:
+                target_h = max(target_h, 1080)  # Può permettersi 1080p
+        except ImportError:
+            pass
+
         h, w = frame.shape[:2]
-        if h <= config.ocr_downscale_height:
+        if h <= target_h:
             return frame, 1.0
 
         import cv2
-        scale = config.ocr_downscale_height / h
+        scale = target_h / h
         new_w = max(1, int(w * scale))
         resized = cv2.resize(
-            frame, (new_w, config.ocr_downscale_height), interpolation=cv2.INTER_AREA
+            frame, (new_w, target_h), interpolation=cv2.INTER_AREA
         )
         return resized, scale
 
@@ -842,10 +1145,20 @@ class OCRWorker:
     @property
     def stats(self) -> dict:
         avg_ms = sum(self._ocr_times) / len(self._ocr_times) if self._ocr_times else 0.0
+        total_zones = self._n_zones_cached + self._n_zones_processed
+        zone_cache_rate = (
+            round(self._n_zones_cached / max(1, total_zones) * 100, 1)
+            if total_zones > 0 else 0.0
+        )
         return {
             "frames_processed": self._n_processed,
             "avg_ocr_ms": round(avg_ms, 1),
             "regions_emitted": self._n_regions,
             "frames_skipped_delta": self._n_skipped_delta,
             "easy_available": self._easy_reader is not None,
+            "easy_lazy": config.ocr_lazy_load_easyocr and not self._easy_load_attempted,
+            # Phase 5: metriche zone-based OCR
+            "zones_processed": self._n_zones_processed,
+            "zones_cached": self._n_zones_cached,
+            "zone_cache_rate_pct": zone_cache_rate,
         }

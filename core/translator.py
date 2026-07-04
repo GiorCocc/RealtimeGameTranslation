@@ -26,10 +26,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import OrderedDict
 from queue import Empty, Full, Queue
 from typing import Optional, TYPE_CHECKING
 
 from config import config
+from core.gpu_utils import detect_device, get_optimal_device, check_vram_available
 
 if TYPE_CHECKING:
     # Solo per type hint — evita import pesante/circolare a runtime.
@@ -96,9 +98,9 @@ class TranslationWorker:
         self._tokenizer = None   # MarianTokenizer
         self._device: str = "cpu"
 
-        # Cache LRU implementata come dict + lista d'ordine (vedi sotto).
-        self._cache: dict[str, str] = {}
-        self._cache_order: list[str] = []
+        # Cache LRU implementata come OrderedDict — O(1) per eviction
+        # e move_to_end (vedi sotto).
+        self._cache: OrderedDict[str, str] = OrderedDict()
 
         # Stats
         self._cache_hits: int = 0
@@ -135,13 +137,33 @@ class TranslationWorker:
 
     # ── Model loading ─────────────────────────────────────────────
 
-    @staticmethod
-    def _detect_cuda() -> bool:
-        try:
-            import torch
-            return bool(torch.cuda.is_available())
-        except ImportError:
-            return False
+    def _resolve_device(self) -> str:
+        """
+        Determina il device di inferenza in base alla configurazione
+        ``config.translation_gpu_device`` e alla VRAM disponibile.
+        Usa il modulo centralizzato ``core.gpu_utils``.
+        """
+        mode = config.translation_gpu_device
+        if mode == "auto":
+            device = get_optimal_device(vram_required_mb=400)
+            logger.info("TranslationWorker: device auto-selezionato → %s", device)
+            return device
+        if mode == "cuda":
+            device = detect_device()
+            if device != "cuda":
+                logger.warning(
+                    "TranslationWorker: CUDA richiesto ma non disponibile, "
+                    "fallback a CPU"
+                )
+                return "cpu"
+            return "cuda"
+        # mode == "cpu" o qualsiasi valore sconosciuto
+        if mode != "cpu":
+            logger.warning(
+                "TranslationWorker: translation_gpu_device='%s' non "
+                "riconosciuto, uso CPU", mode,
+            )
+        return "cpu"
 
     def _load_model(self) -> None:
         """
@@ -156,11 +178,7 @@ class TranslationWorker:
         """
         from transformers import MarianMTModel, MarianTokenizer
 
-        self._device = "cuda" if self._detect_cuda() else "cpu"
-        logger.info(
-            "TranslationWorker: CUDA %s",
-            "disponibile (GPU)" if self._device == "cuda" else "non disponibile (CPU)",
-        )
+        self._device = self._resolve_device()
 
         local_path = config.marian_model_local_path
         if local_path.exists():
@@ -177,6 +195,23 @@ class TranslationWorker:
         self._model = MarianMTModel.from_pretrained(source)
         self._model.to(self._device)
         self._model.eval()
+
+        # ── FP16 (half-precision) — dimezza VRAM, ~+40% velocità ──
+        if self._device == "cuda" and config.translation_use_fp16:
+            self._model = self._model.half()
+            logger.info("TranslationWorker: FP16 abilitato (dimezza VRAM, +40%% velocità)")
+
+        # ── torch.compile() — ottimizzazione PyTorch 2.x+ ────────
+        if self._device == "cuda" and config.translation_use_compile:
+            try:
+                import torch
+                if hasattr(torch, "compile"):
+                    self._model = torch.compile(self._model, mode="reduce-overhead")
+                    logger.info("TranslationWorker: torch.compile() abilitato (mode=reduce-overhead)")
+                else:
+                    logger.warning("TranslationWorker: torch.compile() non disponibile (richiede PyTorch 2.x+)")
+            except Exception:
+                logger.warning("TranslationWorker: torch.compile() fallito, proseguo senza", exc_info=True)
 
         # Salva localmente per uso offline futuro se scaricato ora.
         if source != str(local_path):
@@ -210,7 +245,7 @@ class TranslationWorker:
         """
         while not self._stop_event.is_set():
             try:
-                regions: list["TextRegion"] = self.input_queue.get(timeout=0.5)
+                item = self.input_queue.get(timeout=0.5)
             except Empty:
                 continue
 
@@ -218,15 +253,21 @@ class TranslationWorker:
             # solo il più recente (priorità alla latenza).
             while True:
                 try:
-                    regions = self.input_queue.get_nowait()
+                    item = self.input_queue.get_nowait()
                 except Empty:
                     break
+
+            if isinstance(item, tuple) and len(item) == 2:
+                regions, capture_time = item
+            else:
+                regions = item
+                capture_time = time.perf_counter()
 
             if not regions:
                 # Nessuna regione di testo: propaga comunque una lista
                 # vuota così l'overlay può rimuovere le label residue.
                 logger.debug("TranslationWorker: batch vuoto ricevuto (nessun testo da tradurre)")
-                self._emit([])
+                self._emit([], capture_time)
                 continue
 
             logger.debug(
@@ -249,7 +290,7 @@ class TranslationWorker:
                     # Emissione progressiva: l'overlay/il consumer vede
                     # subito le traduzioni completate finora, non solo a
                     # fine batch.
-                    self._emit(list(accumulated_output))
+                    self._emit(list(accumulated_output), capture_time)
                     logger.debug(
                         "TranslationWorker: chunk tradotto ed emesso — "
                         "%d/%d region/i completate finora: %s",
@@ -271,17 +312,18 @@ class TranslationWorker:
                 self._translation_times.pop(0)
             self._batches_processed += 1
 
-    def _emit(self, output: list) -> None:
-        """Mette `output` in output_queue, rimpiazzando il più vecchio se piena."""
+    def _emit(self, output: list, capture_time: float) -> None:
+        """Mette `(output, capture_time)` in output_queue, rimpiazzando il più vecchio se piena."""
+        payload = (output, capture_time)
         try:
-            self.output_queue.put_nowait(output)
+            self.output_queue.put_nowait(payload)
         except Full:
             try:
                 self.output_queue.get_nowait()
             except Empty:
                 pass
             try:
-                self.output_queue.put_nowait(output)
+                self.output_queue.put_nowait(payload)
             except Full:
                 pass
 
@@ -329,14 +371,22 @@ class TranslationWorker:
         """
         Inferenza MarianMT su una lista di stringhe, suddivisa in batch
         da al massimo _MAX_GENERATE_BATCH_SIZE elementi per contenere
-        l'uso di RAM/VRAM.
+        l'uso di RAM/VRAM. Il batch size viene ridotto automaticamente
+        se la VRAM disponibile è insufficiente.
         """
         import torch
 
+        # ── Adaptive batch size — riduce se la VRAM è bassa ──────
+        effective_batch = _MAX_GENERATE_BATCH_SIZE
+        if self._device == "cuda":
+            if not check_vram_available(required_mb=256):
+                effective_batch = max(4, _MAX_GENERATE_BATCH_SIZE // 2)
+                logger.debug("TranslationWorker: VRAM bassa, batch ridotto a %d", effective_batch)
+
         all_translations: list[str] = []
 
-        for start in range(0, len(texts), _MAX_GENERATE_BATCH_SIZE):
-            chunk = texts[start:start + _MAX_GENERATE_BATCH_SIZE]
+        for start in range(0, len(texts), effective_batch):
+            chunk = texts[start:start + effective_batch]
             t_chunk = time.perf_counter()
 
             inputs = self._tokenizer(
@@ -361,40 +411,38 @@ class TranslationWorker:
             all_translations.extend(decoded)
             logger.debug(
                 "TranslationWorker: chunk di %d testi tradotto in %.0f ms "
-                "(num_beams=%d, max_new_tokens=%d, device=%s)",
+                "(num_beams=%d, max_new_tokens=%d, device=%s, batch_size=%d)",
                 len(chunk),
                 (time.perf_counter() - t_chunk) * 1000,
                 config.translation_num_beams,
                 config.translation_max_new_tokens,
                 self._device,
+                effective_batch,
             )
 
         return all_translations
 
     # ── LRU Cache ─────────────────────────────────────────────────
-    # Implementata come dict + lista d'ordine invece di @lru_cache
-    # perché @lru_cache non funziona su metodi (self non è hashable in
-    # modo stabile tra le chiamate) e perché serve poter ispezionare
-    # hit/miss per le statistiche esposte in .stats.
+    # Implementata come OrderedDict con move_to_end/popitem — O(1) per
+    # tutte le operazioni LRU. Non usa @lru_cache perché serve poter
+    # ispezionare hit/miss per le statistiche esposte in .stats.
 
     def _translate_cached(self, text: str) -> Optional[str]:
         """Restituisce la traduzione dalla cache o None se assente."""
-        return self._cache.get(text)
+        if text in self._cache:
+            self._cache.move_to_end(text)  # Segna come usato di recente
+            return self._cache[text]
+        return None
 
     def _store_cache(self, original: str, translation: str) -> None:
         """Salva una traduzione nella cache, rispettando il limite LRU."""
         if original in self._cache:
-            # Già presente (race tra due miss sullo stesso testo nello
-            # stesso batch): aggiorna solo il valore, non l'ordine.
             self._cache[original] = translation
+            self._cache.move_to_end(original)
             return
-
         if len(self._cache) >= config.translation_cache_maxsize:
-            oldest_key = self._cache_order.pop(0)
-            del self._cache[oldest_key]
-
+            self._cache.popitem(last=False)  # Rimuove il più vecchio — O(1)
         self._cache[original] = translation
-        self._cache_order.append(original)
 
     # ── Stats ─────────────────────────────────────────────────────
 

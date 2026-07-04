@@ -93,6 +93,10 @@ class TranslationPipeline:
 
         self._running: bool = False
 
+        # Phase 5: Latenza end-to-end
+        self.last_e2e_latency_ms: float = 0.0
+        self._e2e_latencies: list[float] = []
+
     @property
     def translation_queue(self) -> Queue:
         """Accesso diretto alla queue di output, utile in modalità headless."""
@@ -142,6 +146,20 @@ class TranslationPipeline:
             output_queue=self._ocr_queue,
         )
         self._ocr.start()
+
+        # Warm-up sequence silenziosa (Phase 5)
+        logger.info("Pipeline: esecuzione warm-up silenzioso...")
+        try:
+            # Warm-up translator (carica pesi / riscalda CUDA kernels)
+            self._translator.translate_batch(["Warm up."])
+            # Warm-up OCR (riscalda modelli PaddleOCR con un frame fittizio vuoto)
+            import numpy as np
+            dummy_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+            # Chiamiamo _process_frame_full per riscaldare la pipeline completa
+            self._ocr._process_frame_full(dummy_frame, [True] * (config.frame_diff_grid_rows * config.frame_diff_grid_cols))
+            logger.info("Pipeline: warm-up completato con successo")
+        except Exception:
+            logger.warning("Pipeline: errore durante il warm-up (proseguo comunque)", exc_info=True)
 
         # 3) CaptureThread — inizia subito a produrre frame.
         #    mode/window_title/region (Phase 6): vedere config.capture_mode.
@@ -249,9 +267,23 @@ class TranslationPipeline:
         def _bridge_loop() -> None:
             while not self._bridge_stop.is_set():
                 try:
-                    output = self._translation_queue.get(timeout=0.5)
+                    item = self._translation_queue.get(timeout=0.5)
                 except Empty:
                     continue
+
+                if isinstance(item, tuple) and len(item) == 2:
+                    output, capture_time = item
+                else:
+                    output = item
+                    capture_time = None
+
+                # Calcola latenza end-to-end (Phase 5)
+                if capture_time is not None:
+                    latency_ms = (time.perf_counter() - capture_time) * 1000
+                    self.last_e2e_latency_ms = latency_ms
+                    self._e2e_latencies.append(latency_ms)
+                    if len(self._e2e_latencies) > 50:
+                        self._e2e_latencies.pop(0)
 
                 # Se siamo in modalità finestra (o regione limitata), ricaviamo l'offset
                 # (left, top) relativo al monitor e trasliamo la bbox di conseguenza,
@@ -287,7 +319,17 @@ class TranslationPipeline:
     @property
     def stats(self) -> dict:
         """Statistiche aggregate da tutti gli stadi."""
-        result: dict = {"running": self._running}
+        avg_e2e = sum(self._e2e_latencies) / len(self._e2e_latencies) if self._e2e_latencies else 0.0
+        result: dict = {
+            "running": self._running,
+            "e2e_latency_ms": round(self.last_e2e_latency_ms, 1),
+            "avg_e2e_latency_ms": round(avg_e2e, 1),
+            "queue_sizes": {
+                "capture_queue": self._capture_queue.qsize(),
+                "ocr_queue": self._ocr_queue.qsize(),
+                "translation_queue": self._translation_queue.qsize(),
+            }
+        }
         if self._capture:
             result["capture"] = self._capture.stats
         if self._ocr:

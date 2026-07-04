@@ -47,6 +47,18 @@ class Config:
     # Solo le celle cambiate vengono passate all'OCR (ottimizzazione Phase 5).
     frame_diff_grid_rows: int = 4
     frame_diff_grid_cols: int = 4
+    # Metodo di confronto celle: "md5" (hash MD5, backward compatible) oppure
+    # "fast" (Mean Absolute Difference su sotto-campione numpy — molto più
+    # veloce perché evita .tobytes() e hashing crittografico).
+    frame_diff_method: str = "fast"
+    # Soglia MAD per la modalità "fast": valori 0-255. Una cella è considerata
+    # cambiata se la differenza media assoluta del sotto-campione supera
+    # questo valore. Valori tipici: 3-10 (più basso = più sensibile).
+    frame_diff_threshold: int = 5
+    # FPS adattivo: se True, CaptureThread dimezza l'FPS effettivo quando
+    # la queue di output è costantemente piena (backpressure) e lo ripristina
+    # quando la pressione cala. Riduce il carico CPU/GPU inutile.
+    capture_adaptive_fps: bool = True
 
     # ── OCR ───────────────────────────────────────────────────────
     ocr_confidence_threshold: float = 0.7   # Scarta rilevamenti sotto soglia
@@ -109,6 +121,17 @@ class Config:
     debug_show_fps: bool = False            # Mostra FPS nell'overlay
     debug_show_bboxes: bool = False         # Disegna bounding box OCR
     debug_capture_preview: bool = False     # Finestra OpenCV con preview cattura
+
+    # ── Phase 5: Performance ─────────────────────────────────────────
+    capture_adaptive_fps: bool = True       # Riduce FPS automaticamente sotto carico
+    frame_diff_method: str = "fast"         # "md5" (preciso) | "fast" (numpy MAD)
+    frame_diff_threshold: int = 5           # Soglia MAD per metodo "fast" (0-255)
+    ocr_gpu_device: str = "auto"            # "auto" | "cuda" | "cpu"
+    translation_gpu_device: str = "auto"    # "auto" | "cuda" | "cpu"
+    translation_use_fp16: bool = True       # FP16 inference su GPU (dimezza VRAM, +40% velocità)
+    translation_use_compile: bool = False   # torch.compile() opt-in (richiede PyTorch 2.x+)
+    perf_process_priority: str = "below_normal"  # "normal" | "below_normal" | "idle"
+    ocr_lazy_load_easyocr: bool = True      # Carica EasyOCR solo al primo fallback
 
     def __post_init__(self) -> None:
         # Assicura che la cartella modelli esista

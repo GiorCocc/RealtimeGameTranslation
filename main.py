@@ -998,6 +998,172 @@ def _show_stats_dialog(pipeline) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════
+# Phase 5: Profiling Benchmark Runner
+# ══════════════════════════════════════════════════════════════════
+
+def run_phase5(monitor_index: int, debug: bool = False) -> None:
+    """
+    Phase 5: Profiling Benchmark Runner.
+    Gira headless per 30 secondi raccogliendo statistiche dettagliate
+    sulle performance (latenza e2e, uso CPU/RAM del processo, GPU/VRAM,
+    tempo OCR/traduzione, frame rate effettivo, ecc.) e produce un report.
+    """
+    import psutil
+    import numpy as np
+    from core.pipeline import TranslationPipeline
+    from core.capture import list_monitors
+    from core.gpu_utils import detect_device
+
+    _print_banner("Phase 5: Performance Profiling Benchmark")
+
+    monitors = list_monitors()
+    if not monitors:
+        logger.error("Nessun monitor rilevato.")
+        sys.exit(1)
+
+    if monitor_index >= len(monitors):
+        logger.error("Monitor %d non trovato (disponibili: %d).", monitor_index, len(monitors))
+        sys.exit(1)
+
+    config.monitor_index = monitor_index
+    config.debug_capture_preview = False
+
+    print("Inizializzazione della pipeline...")
+    pipeline = TranslationPipeline()
+    
+    # Liste per accumulare metriche
+    e2e_history = []
+    cpu_history = []
+    ram_history = []
+    
+    running = True
+    def _on_signal(sig, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    # Avvio pipeline
+    pipeline.start()
+    if debug:
+        _enable_debug_logging()
+
+    print()
+    print("Benchmark avviato. Esecuzione per 30 secondi...")
+    print("Traduzione in corso. Premere Ctrl+C per interrompere in anticipo.")
+    print()
+
+    t_start = time.perf_counter()
+    t_end = t_start + 30.0
+    t_last_stats = t_start
+    
+    process = psutil.Process()
+    
+    try:
+        while running and time.perf_counter() < t_end:
+            now = time.perf_counter()
+            
+            # Leggi tutto dalla coda di traduzione
+            while not pipeline.translation_queue.empty():
+                try:
+                    item = pipeline.translation_queue.get_nowait()
+                    if isinstance(item, tuple) and len(item) == 2:
+                        output, capture_time = item
+                        if capture_time is not None:
+                            latency = (time.perf_counter() - capture_time) * 1000
+                            e2e_history.append(latency)
+                except Exception:
+                    break
+            
+            # Campiona CPU e RAM ogni secondo
+            if now - t_last_stats >= 1.0:
+                # cpu_percent() diviso per i core dà la percentuale reale della macchina,
+                # ma vogliamo mostrare l'utilizzo cumulativo dei core per il processo
+                cpu_history.append(process.cpu_percent() / psutil.cpu_count())
+                ram_history.append(process.memory_info().rss / (1024 * 1024))
+                t_last_stats = now
+                
+                # Stampa progresso veloce
+                elapsed = int(now - t_start)
+                print(f"  [Progress] {elapsed:>2}s / 30s | e2e_samples={len(e2e_history)} | cpu={cpu_history[-1]:.1f}% | ram={ram_history[-1]:.0f}MB", end="\r")
+            
+            time.sleep(0.05)
+    finally:
+        print()
+        print("\nArresto della pipeline...")
+        pipeline.stop()
+    
+    # ── Calcolo ed esposizione del Report ──────────────────────────
+    print("\n" + "="*60)
+    print("                  PERFORMANCE BENCHMARK REPORT")
+    print("="*60)
+    
+    duration = time.perf_counter() - t_start
+    print(f"Durata benchmark:      {duration:.1f} secondi")
+    
+    # Metriche di sistema
+    avg_cpu = sum(cpu_history) / len(cpu_history) if cpu_history else 0.0
+    max_cpu = max(cpu_history) if cpu_history else 0.0
+    avg_ram = sum(ram_history) / len(ram_history) if ram_history else 0.0
+    max_ram = max(ram_history) if ram_history else 0.0
+    
+    print("\n--- Risorse di Sistema (Processo Python) ---")
+    print(f"CPU Utilization:       Media: {avg_cpu:.1f}% | Max: {max_cpu:.1f}%")
+    print(f"RAM Usage (RSS):       Media: {avg_ram:.1f} MB | Max: {max_ram:.1f} MB")
+    
+    # Informazioni sulla GPU
+    gpu_info = detect_device()
+    print(f"Backend attivo:        {gpu_info.backend.upper()}")
+    if gpu_info.backend == "cuda":
+        print(f"Nome GPU:              {gpu_info.device_name}")
+        print(f"VRAM Utilizzata/Tot:   {gpu_info.vram_total_mb - gpu_info.vram_free_mb} MB / {gpu_info.vram_total_mb} MB")
+        
+    # Metriche della Pipeline
+    s = pipeline.stats
+    cap_s = s.get("capture", {})
+    ocr_s = s.get("ocr", {})
+    tr_s = s.get("translation", {})
+    
+    print("\n--- Capture Pipeline ---")
+    print(f"Frame catturati:       {cap_s.get('frames_captured', 0)}")
+    print(f"Frame saltati (MAD):   {cap_s.get('frames_skipped', 0)} ({cap_s.get('skip_rate_pct', 0)}%)")
+    print(f"Frame droppati (Full): {cap_s.get('frames_dropped', 0)}")
+    print(f"FPS effettivi:         {cap_s.get('effective_fps', 0)} (target: {config.capture_fps})")
+    if "adaptive_fps" in cap_s:
+        print(f"Adaptive FPS effettivo:{cap_s.get('adaptive_fps', config.capture_fps)} FPS")
+        
+    print("\n--- OCR Processing (PaddleOCR) ---")
+    print(f"Frame analizzati:      {ocr_s.get('frames_processed', 0)}")
+    print(f"Tempo OCR medio:       {ocr_s.get('avg_ocr_ms', 0):.1f} ms")
+    print(f"Regioni individuate:   {ocr_s.get('regions_emitted', 0)}")
+    print(f"Zone OCR Cached:       {ocr_s.get('zones_cached', 0)}")
+    print(f"Zone OCR Processed:    {ocr_s.get('zones_processed', 0)}")
+    print(f"Zone Cache Hit Rate:   {ocr_s.get('zone_cache_rate_pct', 0):.1f}%")
+    
+    print("\n--- Translation (MarianMT) ---")
+    print(f"Batch tradotti:        {tr_s.get('batches_processed', 0)}")
+    print(f"Linguaggi:             {config.source_language.upper()} -> {config.target_language.upper()}")
+    print(f"Tempo traduzione med:  {tr_s.get('avg_translation_ms', 0):.1f} ms")
+    print(f"Cache Hit Rate:        {tr_s.get('cache_hit_rate_pct', 0):.1f}% (size: {tr_s.get('cache_size', 0)})")
+    
+    print("\n--- Latenza End-to-End (Capture -> Overlay) ---")
+    if e2e_history:
+        e2e_arr = np.array(e2e_history)
+        avg_e2e = np.mean(e2e_arr)
+        p95_e2e = np.percentile(e2e_arr, 95)
+        p99_e2e = np.percentile(e2e_arr, 99)
+        print(f"Latenza media:         {avg_e2e:.1f} ms")
+        print(f"Latenza 95th (p95):    {p95_e2e:.1f} ms")
+        print(f"Latenza 99th (p99):    {p99_e2e:.1f} ms")
+    else:
+        print("Latenza End-to-End:    Nessun dato raccolto (nessun testo rilevato sullo schermo).")
+        
+    print("="*60)
+    print()
+
+
+# ══════════════════════════════════════════════════════════════════
 # CLI
 # ══════════════════════════════════════════════════════════════════
 
@@ -1013,7 +1179,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="N",
         help="Fase da testare (1=capture, 2=ocr, 3=traduzione, "
-             "4=app completa). Omettere per avvio completo.",
+             "4=app completa, 5=performance benchmark). Omettere per avvio completo.",
     )
     p.add_argument(
         "--monitor", "-m",
@@ -1045,6 +1211,21 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
 
+    # ── GC Tuning (Phase 5) ──────────────────────────────────────────
+    import gc
+    gc.set_threshold(50000, 50, 50)  # Riduce frequenza GC per evitare micro-stuttering
+
+    # ── Process priority BELOW_NORMAL (Phase 5) ──────────────────────
+    try:
+        import ctypes
+        # BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+        ctypes.windll.kernel32.SetPriorityClass(
+            ctypes.windll.kernel32.GetCurrentProcess(),
+            0x00004000
+        )
+    except Exception:
+        pass
+
     if args.debug:
         _enable_debug_logging()
 
@@ -1072,7 +1253,12 @@ if __name__ == "__main__":
         )
     elif args.phase == 4 or args.phase is None:
         run_full_app(debug=args.debug)
+    elif args.phase == 5:
+        run_phase5(
+            monitor_index=args.monitor,
+            debug=args.debug,
+        )
     else:
         print(f"Phase {args.phase} non ancora implementata.")
-        print("Fasi disponibili: 1 (capture), 2 (OCR), 3 (traduzione), 4 (overlay).")
+        print("Fasi disponibili: 1 (capture), 2 (OCR), 3 (traduzione), 4 (overlay), 5 (perf benchmark).")
         sys.exit(1)

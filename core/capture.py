@@ -1,16 +1,20 @@
 """
 core/capture.py — Phase 1: Screen Capture Pipeline
+                  + Phase 5: fast frame differencing & adaptive FPS
                   + Phase 6: cattura di una finestra specifica (stile OBS)
 
 Responsabilità:
   - Cattura continua dello schermo tramite dxcam (DXGI Desktop Duplication API)
   - Frame differencing a griglia per saltare frame identici
   - Produzione frame in una queue thread-safe per il consumer OCR
+  - (Phase 5) Modalità "fast" numpy-based Mean Absolute Difference per il
+    confronto celle, alternativa all'hash MD5 (evita .tobytes()). FPS
+    adattivo con rilevamento della backpressure sulla queue.
   - (Phase 6) Cattura limitata al rettangolo di una finestra specifica,
     selezionabile dal pannello Settings, invece dell'intero monitor
 
 Classi pubbliche:
-  FrameDifferencer  — confronto frame su griglia NxM con hash MD5
+  FrameDifferencer  — confronto frame su griglia NxM (MD5 o MAD numpy)
   CaptureThread     — thread daemon che produce (frame, changed_cells) nella queue
   list_monitors()   — utility per enumerare i monitor disponibili
   list_windows()    — utility per enumerare le finestre visibili (selezione stile OBS)
@@ -22,6 +26,7 @@ per uso real-time (vedere KNOWLEDGE_BASE.md §13).
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import logging
 import threading
@@ -40,10 +45,22 @@ logger = logging.getLogger(__name__)
 # Frame Differencing
 # ══════════════════════════════════════════════════════════════════
 
+# Dimensione fissa del sotto-campione per la modalità "fast" (MAD numpy).
+# 16×16 è un buon compromesso: abbastanza piccolo da essere rapidissimo,
+# abbastanza grande da catturare cambiamenti significativi nella cella.
+_FAST_SAMPLE_SIZE: int = 16
+
+
 class FrameDifferencer:
     """
-    Divide il frame in una griglia rows×cols e calcola l'MD5 di ogni cella.
-    Confrontando con il frame precedente, identifica quali celle sono cambiate.
+    Divide il frame in una griglia rows×cols e rileva quali celle sono
+    cambiate rispetto al frame precedente.
+
+    Supporta due modalità (config.frame_diff_method):
+      - "md5":  hash MD5 di ogni cella (backward compatible, preciso al pixel)
+      - "fast": sotto-campiona ogni cella a 16×16 via slicing numpy e usa la
+               Mean Absolute Difference (MAD) per il confronto — nessuna
+               copia .tobytes(), ~3-5× più veloce dell'MD5 su griglie 4×4
 
     Usato per:
       1. Decidere se passare il frame all'OCR (skip se nulla è cambiato)
@@ -59,11 +76,14 @@ class FrameDifferencer:
     def __init__(self, rows: int = 4, cols: int = 4) -> None:
         self.rows = rows
         self.cols = cols
+        # Stato per la modalità "md5"
         self._prev_hashes: list[str] = []
+        # Stato per la modalità "fast" (sotto-campioni numpy delle celle)
+        self._prev_samples: list[np.ndarray] = []
 
     def compute(self, frame: np.ndarray) -> tuple[bool, list[bool]]:
         """
-        Confronta `frame` con il precedente.
+        Confronta `frame` con il precedente usando il metodo configurato.
 
         Returns:
             (any_changed, changed_cells)
@@ -72,6 +92,15 @@ class FrameDifferencer:
 
         Al primo frame restituisce (True, [True, True, ...]).
         """
+        method: str = getattr(config, "frame_diff_method", "fast")
+        if method == "fast":
+            return self._compute_fast(frame)
+        return self._compute_md5(frame)
+
+    # ── Modalità MD5 (backward compatible) ────────────────────────
+
+    def _compute_md5(self, frame: np.ndarray) -> tuple[bool, list[bool]]:
+        """Confronto celle tramite hash MD5 di ogni cella."""
         h, w = frame.shape[:2]
         cell_h = h // self.rows
         cell_w = w // self.cols
@@ -97,9 +126,64 @@ class FrameDifferencer:
         self._prev_hashes = current
         return any(changed), changed
 
+    # ── Modalità Fast (MAD numpy) ─────────────────────────────────
+
+    def _compute_fast(self, frame: np.ndarray) -> tuple[bool, list[bool]]:
+        """
+        Confronto celle tramite Mean Absolute Difference su sotto-campioni.
+
+        Ogni cella viene sotto-campionata a _FAST_SAMPLE_SIZE×_FAST_SAMPLE_SIZE
+        usando slicing numpy (nessun cv2.resize, nessun .tobytes()). Il MAD
+        tra il sotto-campione corrente e il precedente viene confrontato con
+        config.frame_diff_threshold per determinare se la cella è cambiata.
+        """
+        h, w = frame.shape[:2]
+        cell_h = h // self.rows
+        cell_w = w // self.cols
+        n = self.rows * self.cols
+        threshold: int = getattr(config, "frame_diff_threshold", 5)
+
+        current_samples: list[np.ndarray] = []
+        for r in range(self.rows):
+            for c in range(self.cols):
+                y1 = r * cell_h
+                x1 = c * cell_w
+                # Ultima riga/colonna prende i pixel rimanenti (evita buchi)
+                y2 = y1 + cell_h if r < self.rows - 1 else h
+                x2 = x1 + cell_w if c < self.cols - 1 else w
+                cell = frame[y1:y2, x1:x2]
+                # Sotto-campionamento uniforme via slicing
+                ch, cw = cell.shape[:2]
+                step_h = max(1, ch // _FAST_SAMPLE_SIZE)
+                step_w = max(1, cw // _FAST_SAMPLE_SIZE)
+                sample = cell[::step_h, ::step_w]
+                # Ritaglia a dimensione fissa per confronto coerente
+                sample = sample[:_FAST_SAMPLE_SIZE, :_FAST_SAMPLE_SIZE]
+                current_samples.append(sample)
+
+        if not self._prev_samples:
+            # Primo frame: tutto "cambiato" per forzare un run OCR iniziale
+            self._prev_samples = current_samples
+            return True, [True] * n
+
+        changed: list[bool] = []
+        for cur, prev in zip(current_samples, self._prev_samples):
+            # Forma potrebbe differire marginalmente → confronto sicuro
+            if cur.shape != prev.shape:
+                changed.append(True)
+            else:
+                mad: float = float(np.mean(
+                    np.abs(cur.astype(np.int16) - prev.astype(np.int16))
+                ))
+                changed.append(mad > threshold)
+
+        self._prev_samples = current_samples
+        return any(changed), changed
+
     def reset(self) -> None:
         """Invalida lo stato: il prossimo frame verrà sempre considerato cambiato."""
         self._prev_hashes = []
+        self._prev_samples = []
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -129,6 +213,11 @@ class CaptureThread(threading.Thread):
         t.stop()
         t.join(timeout=3)
     """
+
+    # ── Costanti per l'FPS adattivo ────────────────────────────────
+    _BACKPRESSURE_WINDOW: int = 10       # Ultimi N tentativi di put monitorati
+    _BACKPRESSURE_HIGH_PCT: float = 0.7  # ≥70% full → dimezza FPS
+    _BACKPRESSURE_LOW_PCT: float = 0.1   # ≤10% full (≥90% spazio) → ripristina
 
     def __init__(
         self,
@@ -178,6 +267,14 @@ class CaptureThread(threading.Thread):
         self._n_skipped: int = 0
         self._n_dropped: int = 0
         self._t_start: float = 0.0
+
+        # ── Adaptive FPS (Phase 5) ────────────────────────────────
+        # FPS effettivo corrente (può essere dimezzato sotto backpressure)
+        self._adaptive_fps_current: int = target_fps
+        # Storico dei tentativi di put: True = queue era piena, False = ok
+        self._backpressure_history: collections.deque[bool] = collections.deque(
+            maxlen=self._BACKPRESSURE_WINDOW,
+        )
 
         # Regione dxcam effettivamente in uso (relativa al monitor scelto),
         # esposta per diagnostica/preview.
@@ -233,6 +330,7 @@ class CaptureThread(threading.Thread):
             logger.info("dxcam camera avviata")
 
             while not self._stop_event.is_set():
+                loop_start: float = time.perf_counter()
 
                 # Pausa: aspetta finché _running torna Set
                 if not self._running.is_set():
@@ -251,12 +349,14 @@ class CaptureThread(threading.Thread):
                     continue
 
                 # Copia il frame prima di metterlo in queue (dxcam riusa il buffer)
-                payload = (frame.copy(), cells)
+                payload = (frame.copy(), cells, time.perf_counter())
 
+                queue_was_full: bool = False
                 try:
                     self.frame_queue.put_nowait(payload)
                     self._n_captured += 1
                 except Full:
+                    queue_was_full = True
                     # Queue piena: scarta il più vecchio, inserisci il più recente
                     try:
                         self.frame_queue.get_nowait()
@@ -268,6 +368,18 @@ class CaptureThread(threading.Thread):
                         self._n_dropped += 1
                     except Full:
                         pass
+
+                # ── Adaptive FPS: aggiorna storico e regola FPS ───
+                if getattr(config, "capture_adaptive_fps", False):
+                    self._backpressure_history.append(queue_was_full)
+                    self._maybe_adjust_fps()
+
+                    # Throttling: dormi per allinearsi all'FPS effettivo
+                    elapsed: float = time.perf_counter() - loop_start
+                    target_interval: float = 1.0 / self._adaptive_fps_current
+                    sleep_time: float = target_interval - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
 
         except Exception:
             logger.exception("CaptureThread: errore fatale")
@@ -298,8 +410,52 @@ class CaptureThread(threading.Thread):
     def resume(self) -> None:
         """Riprende dopo una pausa."""
         self._differencer.reset()  # forza un run OCR al resume
+        self._adaptive_fps_current = self.target_fps
+        self._backpressure_history.clear()
         self._running.set()
         logger.debug("CaptureThread ripreso")
+
+    # ── Adaptive FPS (Phase 5) ────────────────────────────────────
+
+    def _maybe_adjust_fps(self) -> None:
+        """
+        Regola l'FPS effettivo in base alla pressione sulla queue.
+
+        Se la queue era piena in ≥70% degli ultimi N tentativi, dimezza
+        l'FPS (fino a un minimo di 1). Se la queue aveva spazio in ≥90%
+        degli ultimi N tentativi, ripristina l'FPS originale.
+        """
+        if len(self._backpressure_history) < self._BACKPRESSURE_WINDOW:
+            return  # Non abbastanza dati per decidere
+
+        full_count: int = sum(self._backpressure_history)
+        full_ratio: float = full_count / self._BACKPRESSURE_WINDOW
+
+        if full_ratio >= self._BACKPRESSURE_HIGH_PCT:
+            new_fps: int = max(1, self._adaptive_fps_current // 2)
+            if new_fps != self._adaptive_fps_current:
+                logger.info(
+                    "Adaptive FPS: backpressure alta (%.0f%% full) — "
+                    "FPS ridotto da %d a %d",
+                    full_ratio * 100,
+                    self._adaptive_fps_current,
+                    new_fps,
+                )
+                self._adaptive_fps_current = new_fps
+                self._backpressure_history.clear()
+
+        elif full_ratio <= self._BACKPRESSURE_LOW_PCT:
+            if self._adaptive_fps_current < self.target_fps:
+                old_fps: int = self._adaptive_fps_current
+                self._adaptive_fps_current = self.target_fps
+                logger.info(
+                    "Adaptive FPS: backpressure bassa (%.0f%% full) — "
+                    "FPS ripristinato da %d a %d",
+                    full_ratio * 100,
+                    old_fps,
+                    self._adaptive_fps_current,
+                )
+                self._backpressure_history.clear()
 
     # ── Stats ─────────────────────────────────────────────────────
 
@@ -315,6 +471,7 @@ class CaptureThread(threading.Thread):
             "uptime_s": round(elapsed, 1),
             "effective_fps": round(self._n_captured / elapsed, 1),
             "skip_rate_pct": round(self._n_skipped / max(1, total) * 100, 1),
+            "adaptive_fps": self._adaptive_fps_current,
             "active_monitor_index": self._active_monitor_index,
             "active_region": self._active_region,
         }

@@ -40,12 +40,12 @@ Il progetto è suddiviso in 6 fasi di sviluppo incrementali. Di seguito è ripor
 
 | Fase | Modulo / File | Stato | Descrizione / Ruolo |
 | :--- | :--- | :--- | :--- |
-| **Fase 1** | `core/capture.py` | ✅ **Completata** | Acquisizione DXGI con `dxcam`, griglia differenziale MD5, gestione dei thread e statistiche aggregate. |
-| **Fase 2** | `core/ocr.py` | ⬜ **TODO** | Integrazione PaddleOCR + EasyOCR fallback, downscale del frame, logica di text delta e filtro di confidenza. |
-| **Fase 3** | `core/translator.py` | ⬜ **TODO** | Caricamento offline di MarianMT da `models/`, inferenza in batch, gestione della cache LRU interna. |
-| **Fase 4** | `core/pipeline.py`<br>`ui/overlay.py` | ⬜ **TODO** | Orchestrazione multithread con segnali Qt; creazione della finestra trasparente click-through con PyQt6, smoother per bounding box e animazione label. |
-| **Fase 5** | Vari | ⬜ **TODO** | Ottimizzazione delle performance (throttling OCR a ~150ms, griglia differenziale a zone e profiling complessivo). |
-| **Fase 6** | `ui/settings.py`<br>`ui/tray.py` | ⬜ **TODO** | Pannello impostazioni PyQt6 (selezione monitor, lingue, soglie), persistenza in `settings.json` ed icona di tray con `pystray`. |
+| **Fase 1** | `core/capture.py` | ✅ **Completata** | Acquisizione DXGI con `dxcam`, griglia differenziale, gestione dei thread e statistiche aggregate. |
+| **Fase 2** | `core/ocr.py` | ✅ **Completata** | Integrazione PaddleOCR + EasyOCR fallback, downscale del frame, logica di text delta e filtro di confidenza. |
+| **Fase 3** | `core/translator.py` | ✅ **Completata** | Caricamento offline di MarianMT da `models/`, inferenza in batch, gestione della cache LRU interna. |
+| **Fase 4** | `core/pipeline.py`<br>`ui/overlay.py` | ✅ **Completata** | Orchestrazione multithread con segnali Qt; creazione della finestra trasparente click-through con PyQt6, smoother per bounding box e animazione label. |
+| **Fase 5** | Vari | ✅ **Completata** | Ottimizzazione delle performance (fast differencing numpy, OCR incrementale per zone, lazy loading, FP16, process priority e benchmark). |
+| **Fase 6** | `ui/settings.py`<br>`ui/tray.py` | ✅ **Completata** | Pannello impostazioni PyQt6 (selezione monitor, lingue, risorse), persistenza in `settings.json` ed icona di tray con `pystray`. |
 
 ---
 
