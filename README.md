@@ -1,6 +1,6 @@
 # Realtime Game Translation Overlay
 
-[![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Python Version](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)](#)
 [![Status](https://img.shields.io/badge/status-active-brightgreen.svg)](#)
@@ -74,7 +74,7 @@ A differenza di altri strumenti, l'applicazione:
 
 ## 🛠️ Tech Stack
 
-- **Linguaggio**: Python 3.11+
+- **Linguaggio**: Python 3.12+
 - **Cattura Schermo**: `dxcam`
 - **Computer Vision & Elaborazione**: `numpy`, `opencv-python`, `pillow`
 - **OCR Engines**: `paddleocr` (PaddlePaddle), `easyocr` (PyTorch)
@@ -252,15 +252,3 @@ I contributi sono sempre benvenuti! Se desideri proporre miglioramenti o segnala
 ## 📄 Licenza
 
 Questo progetto è distribuito sotto licenza MIT. 
-
-> [!NOTE]
-> Il file contenente il testo completo della licenza (`LICENSE`) non è attualmente presente nel repository e dovrebbe essere aggiunto alla directory radice.
-
----
-
-## ✉️ Contatti e Credits
-
-- **Autore**: GiorCocc - [GitHub Profile](https://github.com/GiorCocc)
-- **Sito di Riferimento**: [RealtimeGameTranslation Repo](https://github.com/GiorCocc/RealtimeGameTranslation)
-
-*Grazie a tutti i creatori e manutentori dei pacchetti open-source utilizzati in questa applicazione (PaddleOCR, EasyOCR, Hugging Face Transformers, PyQt6 e dxcam).*
