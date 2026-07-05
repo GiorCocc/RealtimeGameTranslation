@@ -30,6 +30,7 @@ test_*.log
 .vscode
 *.log
 dist
+build
 
 # ── AI assistant ─────────────────────────────────────────────
 GEMINI.md
