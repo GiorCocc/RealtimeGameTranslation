@@ -23,11 +23,13 @@ models/*
 *.jpg
 *.jpeg
 test_*.py
+test_*.log
 
 # ── IDE ──────────────────────────────────────────────
-.idea/
-.vscode/
+.idea
+.vscode
 *.log
+dist
 
 # ── AI assistant ─────────────────────────────────────────────
 GEMINI.md

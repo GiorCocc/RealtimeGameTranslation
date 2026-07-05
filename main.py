@@ -75,6 +75,14 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     stream=sys.stdout,
 )
+if getattr(sys, 'frozen', False):
+    try:
+        from config import ROOT_DIR
+        _file_handler = logging.FileHandler(ROOT_DIR / "app.log", encoding="utf-8")
+        _file_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(name)s — %(message)s", datefmt="%H:%M:%S"))
+        logging.getLogger().addHandler(_file_handler)
+    except Exception:
+        pass
 logger = logging.getLogger(__name__)
 
 # Logger dei nostri moduli su cui vogliamo garantire il livello DEBUG
@@ -1208,7 +1216,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-if __name__ == "__main__":
+def main():
     args = parse_args()
 
     # ── GC Tuning (Phase 5) ──────────────────────────────────────────
@@ -1262,3 +1270,7 @@ if __name__ == "__main__":
         print(f"Phase {args.phase} non ancora implementata.")
         print("Fasi disponibili: 1 (capture), 2 (OCR), 3 (traduzione), 4 (overlay), 5 (perf benchmark).")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

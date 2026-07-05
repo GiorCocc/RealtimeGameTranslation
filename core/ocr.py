@@ -516,7 +516,19 @@ class OCRWorker:
         """
         import paddleocr
 
-        version = getattr(paddleocr, "__version__", "2.0.0")
+        version = getattr(paddleocr, "__version__", None)
+        if version is None:
+            try:
+                from importlib.metadata import version as get_version
+                version = get_version("paddleocr")
+            except Exception:
+                pass
+
+        if not version:
+            # Se siamo in un eseguibile compilato (PyInstaller) e mancano i metadati,
+            # cerchiamo di dedurre la versione dalla presenza dei nuovi moduli (es. _pipelines)
+            version = "3.0.0" if hasattr(paddleocr, "_pipelines") or hasattr(paddleocr, "PaddleOCR") and "device" in paddleocr.PaddleOCR.__init__.__code__.co_varnames else "2.0.0"
+
         try:
             major = int(version.split(".")[0])
         except (ValueError, IndexError):

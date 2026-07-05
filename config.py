@@ -12,13 +12,16 @@ Esempio:
 """
 
 from __future__ import annotations
-
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# Root del progetto (cartella che contiene questo file)
-ROOT_DIR = Path(__file__).parent
+# Root del progetto (cartella che contiene questo file o l'eseguibile se "frozen")
+if getattr(sys, 'frozen', False):
+    ROOT_DIR = Path(sys.executable).parent
+else:
+    ROOT_DIR = Path(__file__).parent
 
 
 @dataclass
