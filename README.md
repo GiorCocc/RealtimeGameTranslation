@@ -65,11 +65,23 @@ A differenza di altri strumenti, l'applicazione:
 
 ## 📷 Demo
 
-> [!NOTE]
+<table>
+  <tr>
+    <td><img width="495" height="388" alt="Screenshot 2026-07-05 165344" src="https://github.com/user-attachments/assets/e453775f-2433-48f4-9258-f69a0a9ed825" /></td>
+    <td><img width="1170" height="767" alt="Screenshot 2026-07-05 161244" src="https://github.com/user-attachments/assets/1e4c3e3e-4228-4fb5-ae12-2862d71cb73c" /></td>
+  </tr>
+  <tr>
+    <td><img width="1170" height="767" alt="Screenshot 2026-07-05 161229" src="https://github.com/user-attachments/assets/8c36ec4e-6cec-405a-bf4b-2cdc4d6dda0b" /></td>
+    <td><img width="1170" height="767" alt="Screenshot 2026-07-05 161234" src="https://github.com/user-attachments/assets/e31a05d6-329f-4a26-8ad2-a7e69e85b84a" /></td>
+    <td><img width="3144" height="1760" alt="Scan_20260705_162643" src="https://github.com/user-attachments/assets/124beb7a-9d30-44b5-8c57-f687a503da29" /></td>
+  </tr>
+</table>
+
+<!-- > [!NOTE]
 > **Placeholder per la Demo**: Attualmente non è presente una demo video o GIF pubblica sul repository. 
 > 
 > *TODO: Aggiungere qui una GIF animata dell'overlay in azione su un videogioco di esempio.*
-
+-->
 ---
 
 ## 🛠️ Tech Stack
