@@ -29,8 +29,10 @@ test_*.log
 .idea
 .vscode
 *.log
-dist
+dist*
 build
+test*
+nuitka*
 
 # ── AI assistant ─────────────────────────────────────────────
 GEMINI.md

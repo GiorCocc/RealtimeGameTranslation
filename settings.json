@@ -1,0 +1,22 @@
+{
+  "source_language": "en",
+  "target_language": "it",
+  "capture_mode": "monitor",
+  "capture_window_title": "(93) Doki Doki Literature Club (Full Game, No Commentary) - YouTube - Google Chrome",
+  "monitor_index": 0,
+  "capture_fps": 30,
+  "debug_capture_preview": false,
+  "ocr_confidence_threshold": 0.7,
+  "ocr_throttle_ms": 150,
+  "ocr_min_text_length": 3,
+  "ocr_use_angle_cls": true,
+  "ocr_downscale": true,
+  "ocr_downscale_height": 720,
+  "overlay_bg_alpha": 160,
+  "overlay_font_size": 14,
+  "overlay_font_family": "Arial",
+  "overlay_smoothing_frames": 4,
+  "overlay_fade_duration_ms": 150,
+  "hotkey_toggle_overlay": "f10",
+  "hotkey_toggle_opaque": "f9"
+}
