@@ -147,8 +147,8 @@ class Config:
 
     @property
     def marian_model_local_path(self) -> Path:
-        """Percorso locale dove il modello viene salvato/caricato."""
-        return self.models_dir / f"opus-mt-{self.source_language}-{self.target_language}"
+        """Percorso locale dove il modello viene salvato/caricato (formato CTranslate2)."""
+        return self.models_dir / f"opus-mt-{self.source_language}-{self.target_language}-ct2"
 
 
 # ── Singleton ─────────────────────────────────────────────────────

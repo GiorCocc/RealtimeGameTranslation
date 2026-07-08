@@ -29,9 +29,10 @@ from __future__ import annotations
 import collections
 import hashlib
 import logging
-import threading
+import multiprocessing
 import time
-from queue import Full, Queue
+import queue
+from multiprocessing import Queue
 from typing import Optional
 
 import numpy as np
@@ -190,28 +191,28 @@ class FrameDifferencer:
 # Capture Thread
 # ══════════════════════════════════════════════════════════════════
 
-class CaptureThread(threading.Thread):
+class CaptureWorker:
     """
-    Thread daemon che cattura lo schermo in continuo tramite dxcam e
+    Processo daemon che cattura lo schermo in continuo tramite dxcam e
     produce tuple (frame_bgr, changed_cells) nella `frame_queue`.
 
     Comportamenti chiave:
       - Frame identici al precedente vengono scartati (zero OCR su freeze)
       - Se la queue è piena, l'elemento più vecchio viene rimosso per far spazio
         al frame più recente (priorità alla latenza, non alla completezza)
-      - Supporta pause/resume per disattivare la cattura senza fermare il thread
-      - Espone statistiche in tempo reale via `.stats`
+      - Supporta pause/resume per disattivare la cattura senza fermare il worker
+      - Espone statistiche in tempo reale via `.stats` (tramite multiprocessing.Queue)
       - (Phase 6) Supporta la cattura limitata a una finestra specifica
         (`mode="window"`) invece dell'intero monitor, in stile "Window
         Capture" di OBS
 
     Uso tipico:
         q = Queue(maxsize=4)
-        t = CaptureThread(q, monitor_index=0, target_fps=30)
-        t.start()
+        worker = CaptureWorker(q, monitor_index=0, target_fps=30)
+        worker.start()
         frame, cells = q.get()
-        t.stop()
-        t.join(timeout=3)
+        worker.stop()
+        worker.join(timeout=3)
     """
 
     # ── Costanti per l'FPS adattivo ────────────────────────────────
@@ -244,7 +245,6 @@ class CaptureThread(threading.Thread):
                 coordinate ASSOLUTE dello schermo. Se fornita ha priorità
                 su `mode`/`window_title` (vedere config.capture_region)
         """
-        super().__init__(daemon=True, name="CaptureThread")
         self.frame_queue = frame_queue
         self.monitor_index = monitor_index
         self.target_fps = target_fps
@@ -252,39 +252,59 @@ class CaptureThread(threading.Thread):
         self.window_title = window_title
         self.region = region
 
-        self._stop_event = threading.Event()
+        self._stop_event = multiprocessing.Event()
         # _running: quando clear() è in pausa (frame_queue smette di ricevere)
-        self._running = threading.Event()
+        self._running = multiprocessing.Event()
         self._running.set()  # attivo per default
 
+        self._process: Optional[multiprocessing.Process] = None
+
+        self._stats_queue = multiprocessing.Queue(maxsize=2)
+        self._cached_stats = {
+            "frames_captured": 0,
+            "frames_skipped": 0,
+            "frames_dropped": 0,
+            "uptime_s": 0.0,
+            "effective_fps": 0.0,
+            "skip_rate_pct": 0.0,
+            "adaptive_fps": target_fps,
+            "active_monitor_index": monitor_index,
+            "active_region": region,
+        }
+
+    # ── Lifecycle ─────────────────────────────────────────────────
+
+    def start(self) -> None:
+        self._process = multiprocessing.Process(
+            target=self._run_process, daemon=True, name="CaptureWorker"
+        )
+        self._process.start()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        if self._process is not None:
+            self._process.join(timeout)
+
+    def _run_process(self) -> None:
+        """Main loop: dxcam → differencing → queue."""
         self._differencer = FrameDifferencer(
             rows=config.frame_diff_grid_rows,
             cols=config.frame_diff_grid_cols,
         )
 
-        # Contatori per .stats
         self._n_captured: int = 0
         self._n_skipped: int = 0
         self._n_dropped: int = 0
-        self._t_start: float = 0.0
+        self._t_start: float = time.perf_counter()
+        self._last_stats_push: float = self._t_start
+        self._last_target_check: float = self._t_start
 
-        # ── Adaptive FPS (Phase 5) ────────────────────────────────
-        # FPS effettivo corrente (può essere dimezzato sotto backpressure)
-        self._adaptive_fps_current: int = target_fps
-        # Storico dei tentativi di put: True = queue era piena, False = ok
+        self._adaptive_fps_current: int = self.target_fps
         self._backpressure_history: collections.deque[bool] = collections.deque(
             maxlen=self._BACKPRESSURE_WINDOW,
         )
 
-        # Regione dxcam effettivamente in uso (relativa al monitor scelto),
-        # esposta per diagnostica/preview.
-        self._active_monitor_index: int = monitor_index
+        self._active_monitor_index: int = self.monitor_index
         self._active_region: Optional[tuple] = None
-
-    # ── Lifecycle ─────────────────────────────────────────────────
-
-    def run(self) -> None:
-        """Main loop: dxcam → differencing → queue."""
         # Import qui: il modulo resta importabile anche su macchine non-Windows
         try:
             import dxcam
@@ -310,7 +330,7 @@ class CaptureThread(threading.Thread):
         self._active_region = effective_region
 
         logger.info(
-            "CaptureThread avviato — modalità=%s  monitor=%d  target_fps=%d  regione=%s",
+            "CaptureWorker avviato — modalità=%s  monitor=%d  target_fps=%d  regione=%s",
             self.mode, effective_monitor_index, self.target_fps,
             effective_region if effective_region else "(intero monitor)",
         )
@@ -334,10 +354,44 @@ class CaptureThread(threading.Thread):
 
                 # Pausa: aspetta finché _running torna Set
                 if not self._running.is_set():
-                    time.sleep(0.05)
+                    self._running.wait()
                     continue
 
-                frame: Optional[np.ndarray] = camera.get_latest_frame()
+                # ── Controllo dinamico target (Phase 6) ───────────
+                if loop_start - self._last_target_check >= 1.0:
+                    self._last_target_check = loop_start
+                    new_mon, new_reg = _resolve_capture_target(
+                        mode=self.mode,
+                        monitor_index=self.monitor_index,
+                        window_title=self.window_title,
+                        region=self.region,
+                    )
+                    if new_mon != self._active_monitor_index or new_reg != self._active_region:
+                        logger.info(
+                            "CaptureWorker: target cambiato (monitor %s -> %s, region %s -> %s). Riavvio dxcam...",
+                            self._active_monitor_index, new_mon,
+                            self._active_region, new_reg
+                        )
+                        self._active_monitor_index = new_mon
+                        self._active_region = new_reg
+                        try:
+                            if camera is not None:
+                                camera.stop()
+                                del camera
+                            camera = dxcam.create(
+                                device_idx=0,
+                                output_idx=self._active_monitor_index,
+                                output_color="BGR",
+                            )
+                            camera.start(
+                                target_fps=self.target_fps,
+                                video_mode=True,
+                                region=self._active_region,
+                            )
+                        except Exception:
+                            logger.exception("CaptureWorker: errore riavvio dxcam")
+
+                frame: Optional[np.ndarray] = camera.get_latest_frame() if camera else None
                 if frame is None:
                     time.sleep(0.005)
                     continue
@@ -355,7 +409,7 @@ class CaptureThread(threading.Thread):
                 try:
                     self.frame_queue.put_nowait(payload)
                     self._n_captured += 1
-                except Full:
+                except queue.Full:
                     queue_was_full = True
                     # Queue piena: scarta il più vecchio, inserisci il più recente
                     try:
@@ -366,7 +420,7 @@ class CaptureThread(threading.Thread):
                         self.frame_queue.put_nowait(payload)
                         self._n_captured += 1
                         self._n_dropped += 1
-                    except Full:
+                    except queue.Full:
                         pass
 
                 # ── Adaptive FPS: aggiorna storico e regola FPS ───
@@ -381,8 +435,17 @@ class CaptureThread(threading.Thread):
                     if sleep_time > 0:
                         time.sleep(sleep_time)
 
+                # ── Invio periodico stats al main process ─────────
+                now_t = time.perf_counter()
+                if now_t - self._last_stats_push >= 1.0:
+                    try:
+                        self._stats_queue.put_nowait(self._compute_stats(now_t))
+                    except queue.Full:
+                        pass
+                    self._last_stats_push = now_t
+
         except Exception:
-            logger.exception("CaptureThread: errore fatale")
+            logger.exception("CaptureWorker: errore fatale")
         finally:
             if camera is not None:
                 try:
@@ -391,7 +454,7 @@ class CaptureThread(threading.Thread):
                 except Exception:
                     logger.warning("Errore chiusura dxcam camera", exc_info=True)
             logger.info(
-                "CaptureThread fermato — catturati=%d  saltati=%d  droppati=%d",
+                "CaptureWorker fermato — catturati=%d  saltati=%d  droppati=%d",
                 self._n_captured,
                 self._n_skipped,
                 self._n_dropped,
@@ -405,7 +468,7 @@ class CaptureThread(threading.Thread):
     def pause(self) -> None:
         """Sospende la produzione di frame (overlay nascosto, CPU a riposo)."""
         self._running.clear()
-        logger.debug("CaptureThread in pausa")
+        logger.debug("CaptureWorker in pausa")
 
     def resume(self) -> None:
         """Riprende dopo una pausa."""
@@ -413,7 +476,7 @@ class CaptureThread(threading.Thread):
         self._adaptive_fps_current = self.target_fps
         self._backpressure_history.clear()
         self._running.set()
-        logger.debug("CaptureThread ripreso")
+        logger.debug("CaptureWorker ripreso")
 
     # ── Adaptive FPS (Phase 5) ────────────────────────────────────
 
@@ -459,10 +522,8 @@ class CaptureThread(threading.Thread):
 
     # ── Stats ─────────────────────────────────────────────────────
 
-    @property
-    def stats(self) -> dict:
-        """Dizionario con statistiche correnti del thread."""
-        elapsed = time.perf_counter() - self._t_start if self._t_start else 1e-9
+    def _compute_stats(self, now: float) -> dict:
+        elapsed = now - self._t_start if self._t_start else 1e-9
         total = self._n_captured + self._n_skipped
         return {
             "frames_captured": self._n_captured,
@@ -475,6 +536,16 @@ class CaptureThread(threading.Thread):
             "active_monitor_index": self._active_monitor_index,
             "active_region": self._active_region,
         }
+
+    @property
+    def stats(self) -> dict:
+        """Dizionario con statistiche correnti del processo."""
+        while not self._stats_queue.empty():
+            try:
+                self._cached_stats = self._stats_queue.get_nowait()
+            except queue.Empty:
+                break
+        return self._cached_stats
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -630,6 +701,8 @@ def list_windows() -> list[dict]:
     windows: list[dict] = []
     try:
         import win32gui  # type: ignore
+        import win32con
+        import ctypes
     except ImportError:
         logger.warning("pywin32 non disponibile — impossibile enumerare le finestre")
         return windows
@@ -637,6 +710,24 @@ def list_windows() -> list[dict]:
     def _enum_handler(hwnd: int, _extra) -> None:
         if not win32gui.IsWindowVisible(hwnd):
             return
+
+        # Filtra finestre "ToolWindow" (es. overlay, menu start)
+        try:
+            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            if ex_style & win32con.WS_EX_TOOLWINDOW:
+                return
+        except Exception:
+            pass
+
+        # Filtra finestre "Cloaked" dal Desktop Window Manager (es. app UWP invisibili)
+        try:
+            cloaked = ctypes.c_int(0)
+            ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+            if cloaked.value != 0:
+                return
+        except Exception:
+            pass
+
         title = win32gui.GetWindowText(hwnd).strip()
         if not title:
             return

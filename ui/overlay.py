@@ -522,6 +522,9 @@ class OverlayWindow(QWidget):
                 entry = self._entries[key]
                 entry.fading_out = False
 
+                if entry.label.text() != translated_text:
+                    entry.smoother.reset()
+
                 smoothed = entry.smoother.update(bbox)
                 x, y, w, h = _bbox_rect(smoothed)
                 x, y, w, h = self._apply_dpi(x, y, w, h)

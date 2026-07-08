@@ -7,15 +7,15 @@ pillow
 opencv-python
 
 # ── OCR ───────────────────────────────────────────────────────────
-# Scegliere UNA delle due righe qui sotto in base all'hardware:
-paddlepaddle==3.2.2      # CPU-only
-# paddlepaddle-gpu       # GPU CUDA (commenta la riga sopra)
-paddleocr
+# Scegliere l'esecuzione adatta:
+onnxruntime              # Sostituisce onnxruntime-directml per avere prestazioni eccellenti su CPU
+rapidocr-onnxruntime     # Drop-in replacement per PaddleOCR, usa ONNX Runtime
 easyocr                  # Fallback per testi su texture / font irregolari
 
 # ── Traduzione locale ─────────────────────────────────────────────
-transformers             # Helsinki-NLP MarianMT
-sentencepiece            # Tokenizer MarianMT
+transformers             # Tokenizer MarianMT
+sentencepiece            # Richiesto da transformers per MarianMT
+ctranslate2              # Motore di inferenza ottimizzato
 # torch già richiesto da paddlepaddle, ma elencato esplicitamente:
 torch                    # CPU — usare torch cu* per CUDA (vedi pytorch.org)
 

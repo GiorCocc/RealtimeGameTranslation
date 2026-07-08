@@ -37,7 +37,9 @@ import logging
 import signal
 import sys
 import time
-from queue import Queue
+import multiprocessing
+from multiprocessing import Queue
+import queue
 
 from config import config
 
@@ -131,7 +133,7 @@ def run_phase1(monitor_index: int, preview: bool) -> None:
       - Statistiche aggiornate ogni 2 secondi
       - Report finale a Ctrl+C
     """
-    from core.capture import CaptureThread, list_monitors
+    from core.capture import CaptureWorker, list_monitors
 
     _print_banner("Phase 1: Capture Pipeline")
 
@@ -164,7 +166,7 @@ def run_phase1(monitor_index: int, preview: bool) -> None:
 
     # ── Setup ─────────────────────────────────────────────────────
     frame_queue: Queue = Queue(maxsize=4)
-    capture = CaptureThread(
+    capture = CaptureWorker(
         frame_queue=frame_queue,
         monitor_index=monitor_index,
         target_fps=config.capture_fps,
@@ -238,7 +240,7 @@ def run_phase1(monitor_index: int, preview: bool) -> None:
         print()
 
 
-def _run_preview_loop(frame_queue: Queue, capture: "CaptureThread", running_ref) -> None:
+def _run_preview_loop(frame_queue: Queue, capture: "CaptureWorker", running_ref) -> None:
     """Gestisce una singola iterazione del loop preview OpenCV."""
     try:
         import cv2
@@ -250,7 +252,11 @@ def _run_preview_loop(frame_queue: Queue, capture: "CaptureThread", running_ref)
         return
 
     try:
-        frame, changed_cells = frame_queue.get(timeout=0.05)
+        item = frame_queue.get(timeout=0.05)
+        if len(item) == 3:
+            frame, changed_cells, _ = item
+        else:
+            frame, changed_cells = item
     except Exception:
         return
 
@@ -339,7 +345,7 @@ def run_phase2(monitor_index: int, preview: bool) -> None:
       - Statistiche ogni 5 secondi
       - Report finale a Ctrl+C
     """
-    from core.capture import CaptureThread, list_monitors
+    from core.capture import CaptureWorker, list_monitors
     from core.ocr import OCRWorker
 
     _print_banner("Phase 2: OCR Pipeline")
@@ -378,7 +384,7 @@ def run_phase2(monitor_index: int, preview: bool) -> None:
     capture_queue: Queue = Queue(maxsize=4)
     ocr_output_queue: Queue = Queue(maxsize=4)
 
-    capture = CaptureThread(
+    capture = CaptureWorker(
         frame_queue=capture_queue,
         monitor_index=monitor_index,
         target_fps=config.capture_fps,
@@ -422,7 +428,10 @@ def run_phase2(monitor_index: int, preview: bool) -> None:
                     break
 
             if new_batch is not None:
-                latest_regions = new_batch
+                if isinstance(new_batch, tuple) and len(new_batch) == 2:
+                    latest_regions = new_batch[0]
+                else:
+                    latest_regions = new_batch
                 _print_ocr_regions(latest_regions)
 
             # Stats ogni 5 secondi
@@ -522,7 +531,12 @@ def _run_phase2_preview(ocr, regions: list) -> None:
         time.sleep(0.05)
         return
 
-    frame = getattr(ocr, "_latest_frame", None)
+    try:
+        frame = ocr.preview_queue.get_nowait()
+        ocr._last_preview_frame = frame
+    except queue.Empty:
+        frame = getattr(ocr, "_last_preview_frame", None)
+
     if frame is None:
         time.sleep(0.05)
         return
@@ -672,7 +686,10 @@ def run_phase3(monitor_index: int, preview: bool, debug: bool = False) -> None:
                     break
 
             if new_batch is not None:
-                latest_output = new_batch
+                if isinstance(new_batch, tuple) and len(new_batch) == 2:
+                    latest_output = new_batch[0]
+                else:
+                    latest_output = new_batch
                 _print_translations(latest_output)
 
             # Stats ogni 5 secondi
@@ -763,7 +780,15 @@ def _run_phase3_preview(pipeline, output: list) -> None:
         return
 
     ocr_worker = getattr(pipeline, "_ocr", None)
-    frame = getattr(ocr_worker, "_latest_frame", None) if ocr_worker else None
+    if ocr_worker and hasattr(ocr_worker, "preview_queue"):
+        try:
+            frame = ocr_worker.preview_queue.get_nowait()
+            ocr_worker._last_preview_frame = frame
+        except queue.Empty:
+            frame = getattr(ocr_worker, "_last_preview_frame", None)
+    else:
+        frame = None
+
     if frame is None:
         time.sleep(0.05)
         return
@@ -1273,4 +1298,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

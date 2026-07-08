@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -57,6 +58,62 @@ from config import config
 logger = logging.getLogger(__name__)
 
 SETTINGS_FILE = Path("settings.json")
+
+
+class HotkeyInput(QLineEdit):
+    """
+    Widget personalizzato per l'acquisizione sicura degli hotkey.
+    Intercetta le combinazioni di tasti senza permettere la normale digitazione.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setPlaceholderText("Premi combinazione...")
+
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        modifiers = event.modifiers()
+
+        if key in (Qt.Key.Key_Shift, Qt.Key.Key_Control, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+            return
+
+        if key == Qt.Key.Key_Tab:
+            super().keyPressEvent(event)
+            return
+
+        if key == Qt.Key.Key_Backspace or key == Qt.Key.Key_Delete:
+            self.clear()
+            return
+
+        # QKeySequence(modifiers | key) a volte ha problemi con i modificatori speciali, 
+        # costruiamo la stringa manualmente per compatibilità con il modulo `keyboard`
+        parts = []
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            parts.append("ctrl")
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            parts.append("alt")
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("shift")
+        if modifiers & Qt.KeyboardModifier.MetaModifier:
+            parts.append("win")
+
+        key_name = ""
+        # Mappa per i tasti principali
+        if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            key_name = chr(key).lower()
+        elif Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+            key_name = chr(key)
+        elif Qt.Key.Key_F1 <= key <= Qt.Key.Key_F24:
+            key_name = f"f{key - Qt.Key.Key_F1 + 1}"
+        else:
+            # Fallback a stringa Qt (a volte potrebbe non combaciare col modulo keyboard)
+            key_seq_str = QKeySequence(key).toString().lower()
+            if key_seq_str:
+                key_name = key_seq_str
+
+        if key_name:
+            parts.append(key_name)
+            self.setText("+".join(parts))
+
 
 # Coppie di lingue supportate (modelli MarianMT disponibili su HuggingFace)
 SUPPORTED_LANGUAGE_PAIRS: list[tuple[str, str, str]] = [
@@ -172,7 +229,7 @@ class SettingsDialog(QDialog):
 
     def _refresh_model_status(self) -> None:
         src, tgt = self.combo_lang_pair.currentData()
-        local_path = config.models_dir / f"opus-mt-{src}-{tgt}"
+        local_path = config.models_dir / f"opus-mt-{src}-{tgt}-ct2"
         if local_path.exists():
             self.label_model_status.setText(f"Presente in locale ({local_path})")
         else:
@@ -190,26 +247,33 @@ class SettingsDialog(QDialog):
         ).start()
 
     def _download_model_worker(self, src: str, tgt: str) -> None:
-        """Eseguito in un thread separato: scarica/verifica il modello MarianMT."""
+        """Eseguito in un thread separato: scarica/verifica e converte il modello MarianMT per CTranslate2."""
         try:
-            local_path = config.models_dir / f"opus-mt-{src}-{tgt}"
+            local_path = config.models_dir / f"opus-mt-{src}-{tgt}-ct2"
             if local_path.exists():
                 self.model_status_signal.emit(f"Già presente in locale: {local_path}")
                 return
 
-            from transformers import MarianMTModel, MarianTokenizer
+            from transformers import MarianTokenizer
+            import ctranslate2
 
             model_name = f"Helsinki-NLP/opus-mt-{src}-{tgt}"
             tokenizer = MarianTokenizer.from_pretrained(model_name)
-            model = MarianMTModel.from_pretrained(model_name)
 
+            self.model_status_signal.emit("Scaricamento e conversione a CTranslate2 in corso...")
+            
+            # Converte il modello da HuggingFace al formato CT2
+            converter = ctranslate2.converters.TransformersConverter(model_name)
             local_path.mkdir(parents=True, exist_ok=True)
+            converter.convert(output_dir=str(local_path), force=True)
+
+            # Salva il tokenizer per l'uso offline
             tokenizer.save_pretrained(str(local_path))
-            model.save_pretrained(str(local_path))
-            self.model_status_signal.emit(f"Scaricato e salvato in: {local_path}")
+            
+            self.model_status_signal.emit(f"Scaricato e convertito in: {local_path}")
         except Exception as exc:  # noqa: BLE001 — mostrare comunque un feedback
-            logger.exception("Errore durante il download del modello %s-%s", src, tgt)
-            self.model_status_signal.emit(f"Errore durante il download: {exc}")
+            logger.exception("Errore durante il download/conversione del modello %s-%s", src, tgt)
+            self.model_status_signal.emit(f"Errore durante il download/conversione: {exc}")
 
     def _on_model_status_update(self, text: str) -> None:
         self.label_model_status.setText(text)
@@ -385,10 +449,10 @@ class SettingsDialog(QDialog):
         self.spin_fade.setSuffix(" ms")
         form.addRow("Durata fade in/out:", self.spin_fade)
 
-        self.edit_hotkey_toggle = QLineEdit()
+        self.edit_hotkey_toggle = HotkeyInput()
         form.addRow("Hotkey toggle overlay (F10):", self.edit_hotkey_toggle)
 
-        self.edit_hotkey_opaque = QLineEdit()
+        self.edit_hotkey_opaque = HotkeyInput()
         form.addRow("Hotkey toggle opacità (F9):", self.edit_hotkey_opaque)
 
         return w

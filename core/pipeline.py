@@ -28,11 +28,13 @@ from __future__ import annotations
 
 import logging
 import time
-from queue import Empty, Queue
+import multiprocessing
+from multiprocessing import Queue
+import queue
 from typing import Optional
 
 from config import config
-from core.capture import CaptureThread
+from core.capture import CaptureWorker
 from core.ocr import OCRWorker
 from core.translator import TranslationWorker
 
@@ -83,7 +85,7 @@ class TranslationPipeline:
         self._translation_queue: Queue = Queue(maxsize=_TRANSLATION_QUEUE_SIZE)
 
         # ── Worker instances ──────────────────────────────────────
-        self._capture: Optional[CaptureThread] = None
+        self._capture: Optional[CaptureWorker] = None
         self._ocr: Optional[OCRWorker] = None
         self._translator: Optional[TranslationWorker] = None
 
@@ -148,23 +150,11 @@ class TranslationPipeline:
         )
         self._ocr.start()
 
-        # Warm-up sequence silenziosa (Phase 5)
-        logger.info("Pipeline: esecuzione warm-up silenzioso...")
-        try:
-            # Warm-up translator (carica pesi / riscalda CUDA kernels)
-            self._translator.translate_batch(["Warm up."])
-            # Warm-up OCR (riscalda modelli PaddleOCR con un frame fittizio vuoto)
-            import numpy as np
-            dummy_frame = np.zeros((100, 100, 3), dtype=np.uint8)
-            # Chiamiamo _process_frame_full per riscaldare la pipeline completa
-            self._ocr._process_frame_full(dummy_frame, [True] * (config.frame_diff_grid_rows * config.frame_diff_grid_cols))
-            logger.info("Pipeline: warm-up completato con successo")
-        except Exception:
-            logger.warning("Pipeline: errore durante il warm-up (proseguo comunque)", exc_info=True)
+        # Warm-up gestito ora all'interno dei rispettivi processi (Phase 5 + multiprocessing)
 
-        # 3) CaptureThread — inizia subito a produrre frame.
+        # 3) CaptureWorker — inizia subito a produrre frame.
         #    mode/window_title/region (Phase 6): vedere config.capture_mode.
-        self._capture = CaptureThread(
+        self._capture = CaptureWorker(
             frame_queue=self._capture_queue,
             monitor_index=config.monitor_index,
             target_fps=config.capture_fps,
@@ -200,9 +190,17 @@ class TranslationPipeline:
 
         if self._ocr:
             self._ocr.stop()
+            self._ocr.join(timeout=3)
+            if self._ocr._process and self._ocr._process.is_alive():
+                logger.warning("Pipeline: OCRWorker bloccato, forzo la terminazione")
+                self._ocr._process.terminate()
 
         if self._translator:
             self._translator.stop()
+            self._translator.join(timeout=3)
+            if self._translator._process and self._translator._process.is_alive():
+                logger.warning("Pipeline: TranslationWorker bloccato, forzo la terminazione")
+                self._translator._process.terminate()
 
         # Rimuove eventuali code residue: un restart non deve mostrare
         # per qualche istante traduzioni "vecchie" della sessione precedente
@@ -211,7 +209,7 @@ class TranslationPipeline:
             while not q.empty():
                 try:
                     q.get_nowait()
-                except Empty:
+                except queue.Empty:
                     break
 
         if self.overlay is not None and hasattr(self.overlay, "clear_all_labels"):
@@ -243,14 +241,22 @@ class TranslationPipeline:
             self.start()
 
     def pause(self) -> None:
-        """Pausa la produzione di frame (es. overlay nascosto con F10)."""
+        """Pausa la produzione di frame (es. overlay nascosto con F10) e scarica i modelli."""
         if self._capture:
             self._capture.pause()
+        if self._ocr:
+            self._ocr.pause()
+        if self._translator:
+            self._translator.pause()
 
     def resume(self) -> None:
-        """Riprende dopo una pausa."""
+        """Riprende dopo una pausa e ricarica i modelli."""
         if self._capture:
             self._capture.resume()
+        if self._ocr:
+            self._ocr.resume()
+        if self._translator:
+            self._translator.resume()
 
     # ── Overlay bridge (thread → Qt signal) ─────────────────────────
 
@@ -269,7 +275,7 @@ class TranslationPipeline:
             while not self._bridge_stop.is_set():
                 try:
                     item = self._translation_queue.get(timeout=0.5)
-                except Empty:
+                except queue.Empty:
                     continue
 
                 if isinstance(item, tuple) and len(item) == 2:
@@ -291,9 +297,11 @@ class TranslationPipeline:
                 # dato che l'OCR ha rilevato il testo a coordinate relative al frame
                 # della finestra, ma l'overlay è a schermo intero sul monitor.
                 offset_x, offset_y = 0, 0
-                if self._capture and self._capture._active_region:
-                    offset_x = self._capture._active_region[0]
-                    offset_y = self._capture._active_region[1]
+                if self._capture:
+                    active_region = self._capture.stats.get("active_region")
+                    if active_region:
+                        offset_x = active_region[0]
+                        offset_y = active_region[1]
 
                 if offset_x != 0 or offset_y != 0:
                     adjusted_output = []

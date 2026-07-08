@@ -1,7 +1,7 @@
 {
   "source_language": "en",
   "target_language": "it",
-  "capture_mode": "monitor",
+  "capture_mode": "window",
   "capture_window_title": "(93) Doki Doki Literature Club (Full Game, No Commentary) - YouTube - Google Chrome",
   "monitor_index": 0,
   "capture_fps": 30,

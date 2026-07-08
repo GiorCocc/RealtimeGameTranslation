@@ -23,16 +23,24 @@ _CUDA_AVAILABLE: bool = False
 
 try:
     import torch
-
     _TORCH_AVAILABLE = True
     _CUDA_AVAILABLE = torch.cuda.is_available()
 except ImportError:
     torch = None  # type: ignore[assignment]
 
+_DML_AVAILABLE: bool = False
+try:
+    import onnxruntime as ort
+    if "DmlExecutionProvider" in ort.get_available_providers():
+        _DML_AVAILABLE = True
+except ImportError:
+    pass
+
 logger.debug(
-    "torch disponibile: %s  |  CUDA disponibile: %s",
+    "torch disponibile: %s  |  CUDA disponibile: %s  |  DirectML disponibile: %s",
     _TORCH_AVAILABLE,
     _CUDA_AVAILABLE,
+    _DML_AVAILABLE,
 )
 
 
@@ -42,8 +50,8 @@ logger.debug(
 class DeviceInfo:
     """Informazioni sul device di calcolo rilevato (GPU o CPU)."""
 
-    backend: str                          # "cuda" oppure "cpu"
-    device_name: str                      # es. "NVIDIA GeForce RTX 4070" o "CPU"
+    backend: str                          # "cuda", "directml", oppure "cpu"
+    device_name: str                      # es. "NVIDIA GeForce RTX 4070", "DirectML GPU" o "CPU"
     vram_total_mb: int                    # 0 per CPU
     vram_free_mb: int                     # 0 per CPU
     compute_capability: tuple[int, int] | None  # Solo per device CUDA
@@ -55,80 +63,65 @@ def detect_device() -> DeviceInfo:
     """Rileva il device di calcolo disponibile.
 
     Tenta di individuare una GPU NVIDIA con supporto CUDA tramite
-    ``torch.cuda``.  Se CUDA non è disponibile (driver mancanti,
-    build CPU-only di PyTorch, ecc.) restituisce un DeviceInfo con
-    backend ``"cpu"``.
-
-    Returns
-    -------
-    DeviceInfo
-        Struttura immutabile con le proprietà del device rilevato.
+    ``torch.cuda``. Se non c'è CUDA, controlla se DirectML è
+    disponibile (per schede AMD/Intel su Windows). Altrimenti fallback su CPU.
     """
-    if not _CUDA_AVAILABLE:
-        logger.info("CUDA non disponibile — fallback a CPU.")
+    if _CUDA_AVAILABLE:
+        assert torch is not None
+        device_index: int = torch.cuda.current_device()
+        device_name: str = torch.cuda.get_device_name(device_index)
+        cap: tuple[int, int] = torch.cuda.get_device_capability(device_index)
+
+        total_bytes: int = torch.cuda.get_device_properties(device_index).total_mem
+        free_bytes: int
+        free_bytes, _ = torch.cuda.mem_get_info(device_index)
+
+        total_mb: int = int(total_bytes / (1024 * 1024))
+        free_mb: int = int(free_bytes / (1024 * 1024))
+
+        info = DeviceInfo(
+            backend="cuda",
+            device_name=device_name,
+            vram_total_mb=total_mb,
+            vram_free_mb=free_mb,
+            compute_capability=cap,
+        )
+        logger.info(
+            "GPU rilevata: %s  |  VRAM totale: %d MB  |  VRAM libera: %d MB  |  "
+            "Compute Capability: %s",
+            info.device_name, info.vram_total_mb, info.vram_free_mb, f"{cap[0]}.{cap[1]}",
+        )
+        return info
+
+    if _DML_AVAILABLE:
+        logger.debug("DirectML disponibile — accelerazione hardware AMD/Intel attiva.")
         return DeviceInfo(
-            backend="cpu",
-            device_name="CPU",
-            vram_total_mb=0,
-            vram_free_mb=0,
+            backend="directml",
+            device_name="DirectML GPU",
+            vram_total_mb=4096,  # Valore fittizio, onnxruntime non espone facile API
+            vram_free_mb=4096,
             compute_capability=None,
         )
 
-    # torch è sicuramente importato se _CUDA_AVAILABLE è True
-    assert torch is not None
-
-    device_index: int = torch.cuda.current_device()
-    device_name: str = torch.cuda.get_device_name(device_index)
-    cap: tuple[int, int] = torch.cuda.get_device_capability(device_index)
-
-    total_bytes: int = torch.cuda.get_device_properties(device_index).total_mem
-    # torch.cuda.mem_get_info restituisce (free, total) in byte
-    free_bytes: int
-    free_bytes, _ = torch.cuda.mem_get_info(device_index)
-
-    total_mb: int = int(total_bytes / (1024 * 1024))
-    free_mb: int = int(free_bytes / (1024 * 1024))
-
-    info = DeviceInfo(
-        backend="cuda",
-        device_name=device_name,
-        vram_total_mb=total_mb,
-        vram_free_mb=free_mb,
-        compute_capability=cap,
+    logger.info("CUDA e DirectML non disponibili — fallback a CPU.")
+    return DeviceInfo(
+        backend="cpu",
+        device_name="CPU",
+        vram_total_mb=0,
+        vram_free_mb=0,
+        compute_capability=None,
     )
-
-    logger.info(
-        "GPU rilevata: %s  |  VRAM totale: %d MB  |  VRAM libera: %d MB  |  "
-        "Compute Capability: %s",
-        info.device_name,
-        info.vram_total_mb,
-        info.vram_free_mb,
-        f"{cap[0]}.{cap[1]}",
-    )
-    return info
 
 
 def get_optimal_device(vram_required_mb: int = 500) -> str:
-    """Restituisce il device ottimale per l'inferenza.
-
-    Se la VRAM libera è sufficiente (≥ *vram_required_mb*) restituisce
-    ``"cuda"``, altrimenti ``"cpu"``.
-
-    Parameters
-    ----------
-    vram_required_mb : int
-        Quantità minima di VRAM libera (in MB) richiesta per
-        selezionare la GPU.  Default: 500 MB.
-
-    Returns
-    -------
-    str
-        ``"cuda"`` oppure ``"cpu"``.
-    """
+    """Restituisce il device ottimale per l'inferenza."""
     info: DeviceInfo = detect_device()
 
     if info.backend == "cpu":
         return "cpu"
+
+    if info.backend == "directml":
+        return "directml"
 
     if info.vram_free_mb < vram_required_mb:
         logger.warning(

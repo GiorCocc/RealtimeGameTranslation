@@ -24,10 +24,11 @@ Vedere KNOWLEDGE_BASE.md §13.
 from __future__ import annotations
 
 import logging
-import threading
+import multiprocessing
 import time
+import queue
 from collections import OrderedDict
-from queue import Empty, Full, Queue
+from multiprocessing import Queue
 from typing import Optional, TYPE_CHECKING
 
 from config import config
@@ -54,53 +55,164 @@ _MAX_TOKEN_LENGTH = 512
 _STATS_WINDOW = 50
 
 
+
+# ══════════════════════════════════════════════════════════════════
+# Translation Engine
+# ══════════════════════════════════════════════════════════════════
+
+class MarianTranslatorEngine:
+    """
+    Motore di traduzione puro: gestisce esclusivamente il caricamento del
+    modello MarianMT e l'inferenza tramite CTranslate2.
+    """
+
+    def __init__(self) -> None:
+        self._model = None
+        self._tokenizer = None
+        self.device: str = "cpu"
+
+    def _resolve_device(self) -> str:
+        mode = config.translation_gpu_device
+        if mode == "auto":
+            device = get_optimal_device(vram_required_mb=400)
+            logger.info("MarianTranslatorEngine: device auto-selezionato → %s", device)
+            return device
+        if mode == "cuda":
+            device = detect_device()
+            if device != "cuda":
+                logger.warning(
+                    "MarianTranslatorEngine: CUDA richiesto ma non disponibile, fallback a CPU"
+                )
+                return "cpu"
+            return "cuda"
+        if mode == "directml":
+            logger.warning("MarianTranslatorEngine: DirectML non supportato da CTranslate2, fallback a CPU")
+            return "cpu"
+        if mode != "cpu":
+            logger.warning(
+                "MarianTranslatorEngine: translation_gpu_device='%s' non riconosciuto, uso CPU",
+                mode
+            )
+        return "cpu"
+
+    def load_model(self) -> None:
+        from transformers import MarianTokenizer
+        import ctranslate2
+
+        self.device = self._resolve_device()
+        local_path = config.marian_model_local_path
+
+        if not local_path.exists():
+            logger.info(
+                "MarianTranslatorEngine: modello locale assente, download da HF e conversione: %s",
+                config.marian_model_name
+            )
+            model_name = config.marian_model_name
+            tokenizer = MarianTokenizer.from_pretrained(model_name)
+            
+            # Converte il modello da HuggingFace al formato CT2
+            converter = ctranslate2.converters.TransformersConverter(model_name)
+            local_path.mkdir(parents=True, exist_ok=True)
+            converter.convert(output_dir=str(local_path), force=True)
+            
+            # Salva il tokenizer per l'uso offline
+            tokenizer.save_pretrained(str(local_path))
+            logger.info("MarianTranslatorEngine: modello salvato in %s", local_path)
+        else:
+            logger.info("MarianTranslatorEngine: modello locale trovato in %s", local_path)
+
+        self._tokenizer = MarianTokenizer.from_pretrained(str(local_path))
+        
+        compute_type = "float16" if (self.device == "cuda" and config.translation_use_fp16) else "default"
+        self._model = ctranslate2.Translator(
+            str(local_path),
+            device=self.device,
+            compute_type=compute_type
+        )
+        logger.info("MarianTranslatorEngine: CTranslate2 Translator caricato su %s", self.device)
+
+    def unload_model(self) -> None:
+        if self._model is not None:
+            self._model = None
+            import gc
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+            logger.info("MarianTranslatorEngine: modello scaricato dalla VRAM")
+
+    def translate(self, texts: list[str]) -> list[str]:
+        if not texts:
+            return []
+        if self._model is None or self._tokenizer is None:
+            raise RuntimeError("Modello non caricato. Chiamare load_model() prima di translate().")
+
+        # Tokenize
+        input_tokens = [self._tokenizer.convert_ids_to_tokens(self._tokenizer.encode(t)) for t in texts]
+
+        # Standard batch size
+        batch_size = 16
+        translations = [None] * len(texts)
+        
+        # We translate in chunks
+        start_idx = 0
+        while start_idx < len(input_tokens):
+            end_idx = min(start_idx + batch_size, len(input_tokens))
+            chunk = input_tokens[start_idx:end_idx]
+            try:
+                results = self._model.translate_batch(
+                    chunk,
+                    beam_size=config.translation_num_beams,
+                    max_decoding_length=config.translation_max_new_tokens
+                )
+                for i, res in enumerate(results):
+                    output_ids = self._tokenizer.convert_tokens_to_ids(res.hypotheses[0])
+                    decoded = self._tokenizer.decode(output_ids, skip_special_tokens=True)
+                    translations[start_idx + i] = decoded
+                start_idx = end_idx
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                is_oom = "out of memory" in exc_str or "oom" in exc_str or "cuda" in exc_str
+                if is_oom and batch_size > 1:
+                    logger.warning(
+                        "MarianTranslatorEngine: Out of memory durante traduzione. "
+                        "Svuoto cache CUDA e dimezzo batch size (%d -> %d). Errore: %s",
+                        batch_size, batch_size // 2, exc
+                    )
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except ImportError:
+                        pass
+                    batch_size = max(1, batch_size // 2)
+                    continue
+                else:
+                    logger.error("MarianTranslatorEngine: errore durante translate_batch: %s", exc)
+                    raise exc
+        return translations  # type: ignore[return-value]
+
+
 # ══════════════════════════════════════════════════════════════════
 # Translation Worker
 # ══════════════════════════════════════════════════════════════════
 
 class TranslationWorker:
     """
-    Worker per traduzione locale con MarianMT (HuggingFace Transformers).
-
-    Flusso:
-      input_queue  → riceve list[TextRegion] da OCRWorker
-      output_queue → produce list[tuple[bbox, translated_text]] verso OverlayWindow
-
-    Ottimizzazioni:
-      - LRU cache: frasi già tradotte restituite istantaneamente
-      - Batch translation: raggruppa le frasi nuove e le traduce in poche
-        chiamate al modello (più efficiente di una chiamata per stringa)
-      - Modello in memoria per tutta la sessione (no reload tra frame)
-      - Come CaptureThread/OCRWorker: se arrivano più batch mentre il
-        worker è occupato, si scarta tutto tranne il più recente
-        (priorità alla latenza, non alla completezza — vedere
-        KNOWLEDGE_BASE.md §5, threading model)
-
-    Uso tipico:
-        input_q = Queue(maxsize=4)
-        output_q = Queue(maxsize=8)
-        translator = TranslationWorker(input_q, output_q)
-        translator.start()      # blocca finché il modello non è caricato
-        translated = output_q.get()
-        translator.stop()
+    Worker per traduzione locale con MarianMT (HuggingFace Transformers + CTranslate2).
     """
 
-    def __init__(
-        self,
-        input_queue: Queue,    # riceve list[TextRegion] da OCRWorker
-        output_queue: Queue,   # produce list[tuple[bbox, str]] verso Overlay
-    ) -> None:
+    def __init__(self, input_queue: Queue, output_queue: Queue) -> None:
         self.input_queue = input_queue
         self.output_queue = output_queue
 
-        self._stop_event = threading.Event()
-        self._model = None       # MarianMTModel
-        self._tokenizer = None   # MarianTokenizer
-        self._device: str = "cpu"
-
-        # Cache LRU implementata come OrderedDict — O(1) per eviction
-        # e move_to_end (vedi sotto).
+        self._stop_event = multiprocessing.Event()
+        self._pause_event = multiprocessing.Event()
         self._cache: OrderedDict[str, str] = OrderedDict()
+        self._model_unloaded: bool = False
 
         # Stats
         self._cache_hits: int = 0
@@ -110,151 +222,81 @@ class TranslationWorker:
         self._translation_times: list[float] = []
         self._t_start: float = 0.0
 
-    # ── Lifecycle ─────────────────────────────────────────────────
+        self._stats_queue = multiprocessing.Queue(maxsize=2)
+        self._last_stats_push: float = 0.0
+        self._cached_stats = {
+            "translations_total": 0,
+            "batches_processed": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "cache_size": 0,
+            "cache_hit_rate_pct": 0.0,
+            "avg_translation_ms": 0.0,
+            "device": "cpu",
+        }
+
+        self._process: Optional[multiprocessing.Process] = None
 
     def start(self) -> None:
-        """Carica il modello (bloccante) e avvia il thread consumer."""
-        logger.info(
-            "TranslationWorker: caricamento modello %s ...",
-            config.marian_model_name,
+        self._process = multiprocessing.Process(
+            target=self._run_process, daemon=True, name="TranslationWorker"
         )
-        self._load_model()
-        self._t_start = time.perf_counter()
-        threading.Thread(
-            target=self._consume_loop, daemon=True, name="TranslationWorker"
-        ).start()
-        logger.info("TranslationWorker avviato (device=%s)", self._device)
+        self._process.start()
+        logger.info("TranslationWorker avviato")
 
     def stop(self) -> None:
         self._stop_event.set()
-        logger.info(
-            "TranslationWorker fermato — batch=%d  traduzioni=%d  "
-            "cache_hit_rate=%.1f%%",
-            self._batches_processed,
-            self._translations_total,
-            self.stats["cache_hit_rate_pct"],
-        )
+        logger.info("TranslationWorker arrestato")
 
-    # ── Model loading ─────────────────────────────────────────────
+    def pause(self) -> None:
+        self._pause_event.set()
 
-    def _resolve_device(self) -> str:
-        """
-        Determina il device di inferenza in base alla configurazione
-        ``config.translation_gpu_device`` e alla VRAM disponibile.
-        Usa il modulo centralizzato ``core.gpu_utils``.
-        """
-        mode = config.translation_gpu_device
-        if mode == "auto":
-            device = get_optimal_device(vram_required_mb=400)
-            logger.info("TranslationWorker: device auto-selezionato → %s", device)
-            return device
-        if mode == "cuda":
-            device = detect_device()
-            if device != "cuda":
-                logger.warning(
-                    "TranslationWorker: CUDA richiesto ma non disponibile, "
-                    "fallback a CPU"
-                )
-                return "cpu"
-            return "cuda"
-        # mode == "cpu" o qualsiasi valore sconosciuto
-        if mode != "cpu":
-            logger.warning(
-                "TranslationWorker: translation_gpu_device='%s' non "
-                "riconosciuto, uso CPU", mode,
-            )
-        return "cpu"
+    def resume(self) -> None:
+        self._pause_event.clear()
 
-    def _load_model(self) -> None:
-        """
-        Carica MarianMT dal disco se presente localmente in models/,
-        altrimenti lo scarica da HuggingFace e lo salva lì per l'uso
-        offline successivo.
+    def join(self, timeout: Optional[float] = None) -> None:
+        if self._process is not None:
+            self._process.join(timeout)
 
-        NOTA: il download iniziale richiede una connessione internet.
-        Una volta scaricato, il modello (~300MB) risiede interamente in
-        models/opus-mt-{src}-{tgt}/ e tutte le esecuzioni successive
-        sono completamente offline, in linea con KNOWLEDGE_BASE.md §13.
-        """
-        from transformers import MarianMTModel, MarianTokenizer
-
-        self._device = self._resolve_device()
-
-        local_path = config.marian_model_local_path
-        if local_path.exists():
-            source = str(local_path)
-            logger.info("TranslationWorker: modello locale trovato in %s", source)
-        else:
-            source = config.marian_model_name
-            logger.info(
-                "TranslationWorker: modello locale assente, download da "
-                "HuggingFace: %s", source,
-            )
-
-        self._tokenizer = MarianTokenizer.from_pretrained(source)
-        self._model = MarianMTModel.from_pretrained(source)
-        self._model.to(self._device)
-        self._model.eval()
-
-        # ── FP16 (half-precision) — dimezza VRAM, ~+40% velocità ──
-        if self._device == "cuda" and config.translation_use_fp16:
-            self._model = self._model.half()
-            logger.info("TranslationWorker: FP16 abilitato (dimezza VRAM, +40%% velocità)")
-
-        # ── torch.compile() — ottimizzazione PyTorch 2.x+ ────────
-        if self._device == "cuda" and config.translation_use_compile:
+    @property
+    def stats(self) -> dict:
+        while not self._stats_queue.empty():
             try:
-                import torch
-                if hasattr(torch, "compile"):
-                    self._model = torch.compile(self._model, mode="reduce-overhead")
-                    logger.info("TranslationWorker: torch.compile() abilitato (mode=reduce-overhead)")
-                else:
-                    logger.warning("TranslationWorker: torch.compile() non disponibile (richiede PyTorch 2.x+)")
-            except Exception:
-                logger.warning("TranslationWorker: torch.compile() fallito, proseguo senza", exc_info=True)
+                self._cached_stats = self._stats_queue.get_nowait()
+            except queue.Empty:
+                break
+        return self._cached_stats
 
-        # Salva localmente per uso offline futuro se scaricato ora.
-        if source != str(local_path):
-            local_path.mkdir(parents=True, exist_ok=True)
-            self._tokenizer.save_pretrained(str(local_path))
-            self._model.save_pretrained(str(local_path))
-            logger.info("TranslationWorker: modello salvato in %s", local_path)
+    def _run_process(self) -> None:
+        # Inizializza il motore di traduzione nello spazio di indirizzamento del subprocesso
+        self.engine = MarianTranslatorEngine()
+        self.engine.load_model()
 
-    # ── Consumer loop ─────────────────────────────────────────────
+        self._t_start = time.perf_counter()
+        self._last_stats_push = self._t_start
+
+        self._consume_loop()
 
     def _consume_loop(self) -> None:
-        """
-        Loop: prende list[TextRegion], traduce, emette list[(bbox, str)]
-        nella output_queue.
-
-        Per ogni batch ricevuto:
-          1. Scarta eventuali batch accumulati: interessa solo il più
-             recente (stessa filosofia di CaptureThread/OCRWorker)
-          2. Suddivide le regioni in chunk da al più
-             _MAX_GENERATE_BATCH_SIZE elementi e le traduce (con cache)
-             un chunk alla volta tramite translate_batch()
-          3. Dopo OGNI chunk, emette subito in output_queue l'insieme
-             cumulativo delle traduzioni completate finora — non aspetta
-             che l'intero batch sia tradotto. Su una scena densa (es.
-             un IDE o un menu con decine di elementi) tradurre tutto il
-             batch su CPU può richiedere anche minuti: aspettare la fine
-             prima di mostrare qualunque risultato violerebbe la
-             filosofia "priorità alla latenza, non completezza" già
-             usata da CaptureThread/OCRWorker (vedere KNOWLEDGE_BASE.md
-             §5, threading model).
-        """
         while not self._stop_event.is_set():
             try:
                 item = self.input_queue.get(timeout=0.5)
-            except Empty:
+            except queue.Empty:
+                if self._pause_event.is_set():
+                    if not self._model_unloaded:
+                        self.engine.unload_model()
+                        self._model_unloaded = True
+                else:
+                    if self._model_unloaded:
+                        self.engine.load_model()
+                        self._model_unloaded = False
                 continue
 
-            # Scarta eventuali batch accumulati nel frattempo: teniamo
-            # solo il più recente (priorità alla latenza).
+            # Svuota buffer e tieni solo l'ultimo per azzerare la latenza
             while True:
                 try:
                     item = self.input_queue.get_nowait()
-                except Empty:
+                except queue.Empty:
                     break
 
             if isinstance(item, tuple) and len(item) == 2:
@@ -264,8 +306,6 @@ class TranslationWorker:
                 capture_time = time.perf_counter()
 
             if not regions:
-                # Nessuna regione di testo: propaga comunque una lista
-                # vuota così l'overlay può rimuovere le label residue.
                 logger.debug("TranslationWorker: batch vuoto ricevuto (nessun testo da tradurre)")
                 self._emit([], capture_time)
                 continue
@@ -287,15 +327,10 @@ class TranslationWorker:
                     accumulated_output.extend(
                         (r.bbox, t) for r, t in zip(chunk_regions, chunk_translated)
                     )
-                    # Emissione progressiva: l'overlay/il consumer vede
-                    # subito le traduzioni completate finora, non solo a
-                    # fine batch.
                     self._emit(list(accumulated_output), capture_time)
                     logger.debug(
-                        "TranslationWorker: chunk tradotto ed emesso — "
-                        "%d/%d region/i completate finora: %s",
-                        len(accumulated_output), len(regions),
-                        [t[:30] for t in chunk_translated],
+                        "TranslationWorker: chunk tradotto ed emesso — %d/%d region/i completate finora",
+                        len(accumulated_output), len(regions)
                     )
             except Exception:
                 logger.exception("TranslationWorker: errore durante translate_batch")
@@ -313,34 +348,28 @@ class TranslationWorker:
             self._batches_processed += 1
 
     def _emit(self, output: list, capture_time: float) -> None:
-        """Mette `(output, capture_time)` in output_queue, rimpiazzando il più vecchio se piena."""
         payload = (output, capture_time)
         try:
             self.output_queue.put_nowait(payload)
-        except Full:
+        except queue.Full:
             try:
                 self.output_queue.get_nowait()
-            except Empty:
+            except queue.Empty:
                 pass
             try:
                 self.output_queue.put_nowait(payload)
-            except Full:
+            except queue.Full:
                 pass
 
-    # ── Translation ───────────────────────────────────────────────
+        now_t = time.perf_counter()
+        if now_t - self._last_stats_push >= 1.0:
+            try:
+                self._stats_queue.put_nowait(self._compute_stats())
+            except queue.Full:
+                pass
+            self._last_stats_push = now_t
 
     def translate_batch(self, texts: list[str]) -> list[str]:
-        """
-        Traduce una lista di stringhe, sfruttando la cache LRU per le
-        frasi già tradotte in precedenza.
-
-        Args:
-            texts: Stringhe nella lingua sorgente (già filtrate da OCR:
-                   lunghezza minima, confidenza minima, ecc.)
-
-        Returns:
-            Lista di traduzioni nello stesso ordine di `texts`.
-        """
         if not texts:
             return []
 
@@ -359,7 +388,7 @@ class TranslationWorker:
                 self._cache_misses += 1
 
         if to_translate:
-            translated = self._run_model(to_translate)
+            translated = self.engine.translate(to_translate)
             for idx, orig, trans in zip(to_translate_idx, to_translate, translated):
                 self._store_cache(orig, trans)
                 results[idx] = trans
@@ -367,87 +396,22 @@ class TranslationWorker:
         self._translations_total += len(texts)
         return results  # type: ignore[return-value]
 
-    def _run_model(self, texts: list[str]) -> list[str]:
-        """
-        Inferenza MarianMT su una lista di stringhe, suddivisa in batch
-        da al massimo _MAX_GENERATE_BATCH_SIZE elementi per contenere
-        l'uso di RAM/VRAM. Il batch size viene ridotto automaticamente
-        se la VRAM disponibile è insufficiente.
-        """
-        import torch
-
-        # ── Adaptive batch size — riduce se la VRAM è bassa ──────
-        effective_batch = _MAX_GENERATE_BATCH_SIZE
-        if self._device == "cuda":
-            if not check_vram_available(required_mb=256):
-                effective_batch = max(4, _MAX_GENERATE_BATCH_SIZE // 2)
-                logger.debug("TranslationWorker: VRAM bassa, batch ridotto a %d", effective_batch)
-
-        all_translations: list[str] = []
-
-        for start in range(0, len(texts), effective_batch):
-            chunk = texts[start:start + effective_batch]
-            t_chunk = time.perf_counter()
-
-            inputs = self._tokenizer(
-                chunk,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=_MAX_TOKEN_LENGTH,
-            )
-            inputs = {k: v.to(self._device) for k, v in inputs.items()}
-
-            with torch.no_grad():
-                generated = self._model.generate(
-                    **inputs,
-                    num_beams=config.translation_num_beams,
-                    max_new_tokens=config.translation_max_new_tokens,
-                )
-
-            decoded = self._tokenizer.batch_decode(
-                generated, skip_special_tokens=True
-            )
-            all_translations.extend(decoded)
-            logger.debug(
-                "TranslationWorker: chunk di %d testi tradotto in %.0f ms "
-                "(num_beams=%d, max_new_tokens=%d, device=%s, batch_size=%d)",
-                len(chunk),
-                (time.perf_counter() - t_chunk) * 1000,
-                config.translation_num_beams,
-                config.translation_max_new_tokens,
-                self._device,
-                effective_batch,
-            )
-
-        return all_translations
-
-    # ── LRU Cache ─────────────────────────────────────────────────
-    # Implementata come OrderedDict con move_to_end/popitem — O(1) per
-    # tutte le operazioni LRU. Non usa @lru_cache perché serve poter
-    # ispezionare hit/miss per le statistiche esposte in .stats.
-
     def _translate_cached(self, text: str) -> Optional[str]:
-        """Restituisce la traduzione dalla cache o None se assente."""
         if text in self._cache:
-            self._cache.move_to_end(text)  # Segna come usato di recente
+            self._cache.move_to_end(text)
             return self._cache[text]
         return None
 
     def _store_cache(self, original: str, translation: str) -> None:
-        """Salva una traduzione nella cache, rispettando il limite LRU."""
         if original in self._cache:
             self._cache[original] = translation
             self._cache.move_to_end(original)
             return
         if len(self._cache) >= config.translation_cache_maxsize:
-            self._cache.popitem(last=False)  # Rimuove il più vecchio — O(1)
+            self._cache.popitem(last=False)
         self._cache[original] = translation
 
-    # ── Stats ─────────────────────────────────────────────────────
-
-    @property
-    def stats(self) -> dict:
+    def _compute_stats(self) -> dict:
         total_lookups = self._cache_hits + self._cache_misses
         avg_ms = (
             sum(self._translation_times) / len(self._translation_times)
@@ -463,5 +427,5 @@ class TranslationWorker:
                 self._cache_hits / max(1, total_lookups) * 100, 1
             ),
             "avg_translation_ms": round(avg_ms, 1),
-            "device": self._device,
+            "device": self.engine.device,
         }

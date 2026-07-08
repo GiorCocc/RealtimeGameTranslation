@@ -52,7 +52,7 @@ A differenza di altri strumenti, l'applicazione:
 - **OCR Incrementale a due livelli**:
   - **PaddleOCR** come motore principale ad altissima precisione.
   - **EasyOCR** (caricato in modalità lazy/on-demand) come fallback per testi irregolari o texture complesse.
-- **Traduzione locale con MarianMT**: Inferenza offline tramite modelli Helsinki-NLP MarianMT ottimizzati in FP16 su GPU CUDA per massimizzare la velocità e dimezzare l'impatto VRAM.
+- **Traduzione locale con MarianMT**: Inferenza offline tramite modelli Helsinki-NLP MarianMT. L'engine di traduzione utilizza **CTranslate2**, garantendo prestazioni eccellenti anche su CPU e un bassissimo consumo di memoria (ottimizzazione FP16).
 - **Cache LRU integrata**: Memorizzazione O(1) delle traduzioni tramite `OrderedDict` per evitare di tradurre testi ripetitivi.
 - **Finestra di Overlay click-through**: Interfaccia frameless PyQt6 configurata con attributi di sistema `WS_EX_TRANSPARENT` per rendersi trasparente all'input del giocatore.
 - **Supporto DPI-Aware**: Gestione nativa del fattore di scala DPI (Per-Monitor V2) per mantenere le bounding box allineate su monitor di qualsiasi risoluzione.
@@ -60,6 +60,7 @@ A differenza di altri strumenti, l'applicazione:
 - **Hotkey Globali**:
   - `F10`: Mostra/nasconde l'overlay grafico.
   - `F9`: Attiva/disattiva lo sfondo opaco dietro le traduzioni per migliorare la leggibilità.
+- **Filtro Avanzato delle Finestre**: Utilizzo di `dwmapi` per filtrare automaticamente "Ghost Windows" e applicazioni di sistema, proponendo all'utente unicamente le finestre di gioco rilevanti, escludendo automaticamente l'overlay stesso dalla traduzione.
 
 ---
 
@@ -92,7 +93,7 @@ A differenza di altri strumenti, l'applicazione:
 - **Cattura Schermo**: `dxcam`
 - **Computer Vision & Elaborazione**: `numpy`, `opencv-python`, `pillow`
 - **OCR Engines**: `paddleocr` (PaddlePaddle), `easyocr` (PyTorch)
-- **Traduzione Locale**: `transformers` (MarianMT), `sacremoses`, `sentencepiece`
+- **Traduzione Locale**: `ctranslate2` (MarianMT), `transformers`, `sentencepiece`
 - **Framework GUI & Integrazione OS**: `PyQt6`, `pywin32` (Win32 API)
 - **Gestione UX**: `keyboard` (hotkey di sistema), `pystray` (system tray icon)
 - **Performance & System Utilities**: `psutil`, `torch` (con supporto CUDA)

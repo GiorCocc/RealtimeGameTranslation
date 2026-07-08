@@ -1,7 +1,9 @@
 Write-Host "Inizio build con Nuitka del progetto Game Translation Overlay (beta)..."
 
 # Pulizia build precedenti
-if (Test-Path "dist_nuitka") { Remove-Item -Recurse -Force "dist_nuitka" }
+param([switch]$Clean)
+
+if ($Clean -and (Test-Path "dist_nuitka")) { Remove-Item -Recurse -Force "dist_nuitka" }
 
 # NOTE sui flag:
 #   --standalone              cartella con exe + tutte le dipendenze (equivalente --onedir)
