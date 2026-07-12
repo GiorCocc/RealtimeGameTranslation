@@ -21,7 +21,10 @@ from typing import Optional
 if getattr(sys, 'frozen', False):
     ROOT_DIR = Path(sys.executable).parent
 else:
-    ROOT_DIR = Path(__file__).parent
+    try:
+        ROOT_DIR = Path(__compiled__.containing_dir)  # Nuitka
+    except NameError:
+        ROOT_DIR = Path(__file__).parent
 
 
 @dataclass

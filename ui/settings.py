@@ -57,7 +57,7 @@ from config import config
 
 logger = logging.getLogger(__name__)
 
-SETTINGS_FILE = Path("settings.json")
+SETTINGS_FILE = Path(ROOT_DIR) / "settings.json"
 
 
 class HotkeyInput(QLineEdit):

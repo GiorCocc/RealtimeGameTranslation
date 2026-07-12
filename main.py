@@ -71,13 +71,19 @@ for _stream in (sys.stdout, sys.stderr):
 # Python (eccezioni non gestite, traceback) continuano comunque a finire
 # su stderr come previsto, quindi restano visibili e correttamente
 # segnalati da PowerShell.
+try:
+    IS_FROZEN = bool(__compiled__)  # True solo dentro l'eseguibile Nuitka
+except NameError:
+    IS_FROZEN = getattr(sys, "frozen", False)  # fallback stile PyInstaller
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
     datefmt="%H:%M:%S",
     stream=sys.stdout,
 )
-if getattr(sys, 'frozen', False):
+#if getattr(sys, 'frozen', False):
+if IS_FROZEN:
     try:
         from config import ROOT_DIR
         _file_handler = logging.FileHandler(ROOT_DIR / "app.log", encoding="utf-8")
