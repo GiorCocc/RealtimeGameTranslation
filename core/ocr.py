@@ -432,18 +432,27 @@ class RapidOCREngine:
 
     def _init_rapidocr(self, device: str):
         from rapidocr_onnxruntime import RapidOCR
-        if device == "cuda":
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        elif device == "directml":
-            providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
-        else:
-            providers = ["CPUExecutionProvider"]
+        use_cuda = device == "cuda"
 
-        return RapidOCR(
-            det_options={'providers': providers},
-            rec_options={'providers': providers},
-            cls_options={'providers': providers}
-        )
+        if device == "directml":
+            logger.warning(
+                "RapidOCREngine: DirectML non supportato da rapidocr-onnxruntime corrente; uso CPU"
+            )
+
+        rapidocr_kwargs = {}
+        if use_cuda:
+            # Questa versione di rapidocr-onnxruntime usa parametri flat det_/rec_/cls_.
+            # model_path deve essere presente (anche None) per evitare KeyError interno.
+            rapidocr_kwargs = {
+                "det_use_cuda": True,
+                "rec_use_cuda": True,
+                "cls_use_cuda": True,
+                "det_model_path": None,
+                "rec_model_path": None,
+                "cls_model_path": None,
+            }
+
+        return RapidOCR(**rapidocr_kwargs)
 
     def run_rapidocr(self, frame: np.ndarray) -> list[tuple]:
         if self._rapidocr_engine is None:
@@ -958,4 +967,4 @@ class OCRWorker:
             "zones_processed": self._n_zones_processed,
             "zones_cached": self._n_zones_cached,
             "zone_cache_rate_pct": zone_cache_rate,
-        }
+        }
