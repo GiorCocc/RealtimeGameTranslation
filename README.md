@@ -85,7 +85,9 @@ A differenza di altri strumenti, l'applicazione:
 > *TODO: Aggiungere qui una GIF animata dell'overlay in azione su un videogioco di esempio.*
 -->
 
-<iframe width="560" height="315" src="https://www.youtube.com/embed/OoMp_xm1U1A" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+<a href="https://www.youtube.com/embed/OoMp_xm1U1A">
+  <img width="1365" height="768" alt="IMeV2oOvH1VCI" src="https://github.com/user-attachments/assets/a9020b2c-5857-42f5-8ef7-3cff8ee9954d" />
+</a>
 
 ---
 
