@@ -30,7 +30,6 @@ Un'applicazione desktop Windows per la traduzione in tempo reale dello schermo d
   - [🗺️ Roadmap](#️-roadmap)
   - [🤝 Contributing](#-contributing)
   - [📄 Licenza](#-licenza)
-  - [✉️ Contatti e Credits](#️-contatti-e-credits)
 
 ---
 
@@ -85,6 +84,9 @@ A differenza di altri strumenti, l'applicazione:
 > 
 > *TODO: Aggiungere qui una GIF animata dell'overlay in azione su un videogioco di esempio.*
 -->
+
+<iframe width="560" height="315" src="https://www.youtube.com/embed/OoMp_xm1U1A" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+
 ---
 
 ## 🛠️ Tech Stack
@@ -137,6 +139,8 @@ pip install -r requirements.txt
 > Per sfruttare al massimo la GPU NVIDIA tramite CUDA:
 > 1. Disinstalla la versione CPU di `paddlepaddle` e installa `paddlepaddle-gpu`.
 > 2. Installa la build di `PyTorch` abilitata a CUDA seguendo le istruzioni ufficiali sul sito di [PyTorch.org](https://pytorch.org/).
+
+Per accelerare la configurazione è possibile eseguire direttamente lo script di setup `setup.bat` incluso nel repository, che installerà automaticamente le dipendenze e configurerà l'ambiente virtuale, controllando anche l'eventuale mancanza delle librerie VCS (Visual C++ Redistributable) necessarie per l'esecuzione di PaddlePaddle e PyTorch.
 
 ---
 

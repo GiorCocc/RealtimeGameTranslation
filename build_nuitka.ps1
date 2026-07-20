@@ -21,25 +21,17 @@ if ($Clean -and (Test-Path "dist_nuitka")) {
     Remove-Item -Recurse -Force "dist_nuitka"
 }
 
-# --- pywin32: DLL di sistema non individuate automaticamente da Nuitka -
-# pythoncomXXX.dll / pywintypesXXX.dll vivono in
-# .venv\Lib\site-packages\pywin32_system32 e NON vengono copiate in
-# modalita' --standalone (bug noto: github.com/Nuitka/Nuitka/issues/696,
-# /issues/740). Senza queste DLL, il primo "import win32api" nell'exe
-# fallisce con ImportError/"DLL load failed" -- probabile causa
-# dell'errore visto finora, dato che ui/overlay.py importa win32api e
-# win32con a livello di modulo (quindi fallisce appena l'app prova a
-# creare l'OverlayWindow, cioe' ad ogni avvio).
-$pywin32Dir = ".\.venv\Lib\site-packages\pywin32_system32"
+# --- pywin32: gestito automaticamente da Nuitka (dll-files plugin) -----
+# Nelle versioni recenti di Nuitka (qui: 4.1.3), pythoncomXXX.dll e
+# pywintypesXXX.dll vengono individuate e copiate in automatico dal
+# dll-files plugin quando scansiona le dipendenze binarie dei moduli
+# nativi inclusi (win32api.pyd, pywintypes.pyd, ecc.). NON includerle
+# di nuovo a mano con --include-data-files: causa un conflitto in fase
+# di link ("data file ... conflicts with dll ...") perche' Nuitka le ha
+# gia' messe li' da sola. Se in futuro dovessi tornare a un errore di
+# ImportError su win32api nell'exe, e' un segnale che vale la pena
+# ricontrollare, ma con questa versione non serve intervento manuale.
 $pywin32Args = @()
-if (Test-Path $pywin32Dir) {
-    Get-ChildItem $pywin32Dir -Filter "*.dll" | ForEach-Object {
-        $pywin32Args += "--include-data-files=$($_.FullName)=$($_.Name)"
-    }
-    Write-Host ("pywin32: {0} DLL di sistema trovate e incluse." -f $pywin32Args.Count)
-} else {
-    Write-Warning "Cartella pywin32_system32 non trovata ($pywin32Dir) - win32api rischia di fallire nell'exe. Verifica il path del venv."
-}
 
 # --- Modelli MarianMT gia' scaricati in locale (opzionale ma consigliato)
 # Se models/ esiste gia' (coppie di lingue scaricate durante lo sviluppo),
@@ -69,6 +61,10 @@ if (Test-Path ".\models") {
 #                                  sottopacchetti "solo training" di paddlepaddle, pesanti
 #                                  e mai usati a runtime -- esclusi per velocizzare la build
 #                                  e ridurre la superficie di errore
+# --nofollow-import-to=sympy.polys.polyquinticconst
+#                                  modulo enorme (costanti precalcolate per equazioni di 5o
+#                                  grado), tirato dentro da torch/sympy ma mai usato da questa
+#                                  app -- da solo puo' richiedere 30-40 minuti di compilazione C
 # --assume-yes-for-downloads      consente a Nuitka di scaricare un compilatore (MinGW64)
 #                                  se non ne trova uno
 
@@ -89,6 +85,7 @@ $nuitkaArgs = @(
     "--nofollow-import-to=matplotlib"
     "--nofollow-import-to=paddle.distributed"
     "--nofollow-import-to=paddle.incubate"
+    "--nofollow-import-to=sympy.polys.polyquinticconst"
     "--include-package-data=paddle"
     "--include-package-data=paddleocr"
     "--include-package-data=paddlex"
